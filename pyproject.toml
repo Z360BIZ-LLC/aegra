@@ -2,6 +2,12 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.uv.workspace]
+members = [".", "./packages/common"]
+
+[tool.uv.sources]
+agent-layer-common = { workspace = true }
+
 [project]
 name = "aegra"
 version = "0.1.0"
@@ -41,6 +47,7 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "uvicorn>=0.35.0",
     "langfuse>=3.3.4",
+    "agent-layer-common",
 ]
 
 [project.urls]
