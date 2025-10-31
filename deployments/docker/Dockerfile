@@ -64,13 +64,15 @@ COPY agents/text/aegra/src/ ./src/
 
 # Copy your custom graphs to src/ as well (contains text_agent/, askz_agent/, no conflict!)
 COPY agents/text/src/ ./src/
-
+COPY agents/text/aegra/deployments/docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 EXPOSE 8000
 
 # Run as non-root
 USER app
 
 # Run uvicorn using uv for AWS Fargate deployment
-CMD ["uv", "run", "uvicorn", "src.agent_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["/entrypoint.sh"]
+#CMD ["uv", "run", "uvicorn", "src.agent_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 
