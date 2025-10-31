@@ -33,7 +33,7 @@ services:
       - DEBUG=true
       - PORT=${PORT:-8000}
       - UV_CACHE_DIR=/tmp/uv-cache
-      - API_BASE_URL=https://staging.z360.biz/api/agent/1  # Points to mock API on host
+      - API_BASE_URL=http://localhost:8000 # Points to mock API on host
     depends_on:
       postgres:
         condition: service_healthy
