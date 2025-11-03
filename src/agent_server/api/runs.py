@@ -25,6 +25,7 @@ from ..core.sse import create_end_event, get_sse_headers
 from ..models import Run, RunCreate, RunStatus, User
 from ..services.langgraph_service import create_run_config, get_langgraph_service
 from ..services.streaming_service import streaming_service
+from ..services.webhook_service import send_run_webhook
 from ..utils.assistants import resolve_assistant_id
 
 router = APIRouter()
@@ -220,6 +221,7 @@ async def create_run(
             request.interrupt_after,
             request.multitask_strategy,
             request.stream_subgraphs,
+            request.webhook,
         )
     )
     print(
@@ -343,6 +345,7 @@ async def create_and_stream_run(
             request.interrupt_after,
             request.multitask_strategy,
             request.stream_subgraphs,
+            request.webhook,
         )
     )
     print(
@@ -729,6 +732,7 @@ async def execute_run_async(
     interrupt_after: str | list[str] | None = None,
     _multitask_strategy: str | None = None,
     subgraphs: bool | None = False,
+    webhook_url: str | None = None,
 ) -> None:
     """Execute run asynchronously in background using streaming to capture all events"""  # Use provided session or get a new one
     if session is None:
@@ -867,6 +871,14 @@ async def execute_run_async(
                 )
             await set_thread_status(session, thread_id, "interrupted")
 
+            # Send webhook notification
+            await send_run_webhook(
+                webhook_url=webhook_url,
+                run_id=run_id,
+                thread_id=thread_id,
+                status="interrupted",
+                output=final_output or {},
+            )
         else:
             # Update with results
             await update_run_status(
@@ -879,6 +891,15 @@ async def execute_run_async(
                 )
             await set_thread_status(session, thread_id, "idle")
 
+            # Send webhook notification
+            await send_run_webhook(
+                webhook_url=webhook_url,
+                run_id=run_id,
+                thread_id=thread_id,
+                status="completed",
+                output=final_output or {},
+            )
+
     except asyncio.CancelledError:
         # Store empty output to avoid JSON serialization issues
         await update_run_status(run_id, "cancelled", output={}, session=session)
@@ -889,6 +910,15 @@ async def execute_run_async(
         await set_thread_status(session, thread_id, "idle")
         # Signal cancellation to broker
         await streaming_service.signal_run_cancelled(run_id)
+
+        # Send webhook notification
+        await send_run_webhook(
+            webhook_url=webhook_url,
+            run_id=run_id,
+            thread_id=thread_id,
+            status="cancelled",
+            output={},
+        )
         raise
     except Exception as e:
         # Store empty output to avoid JSON serialization issues
@@ -902,6 +932,16 @@ async def execute_run_async(
         await set_thread_status(session, thread_id, "idle")
         # Signal error to broker
         await streaming_service.signal_run_error(run_id, str(e))
+
+        # Send webhook notification
+        await send_run_webhook(
+            webhook_url=webhook_url,
+            run_id=run_id,
+            thread_id=thread_id,
+            status="failed",
+            output={},
+            error_message=str(e),
+        )
         raise
     finally:
         # Clean up broker

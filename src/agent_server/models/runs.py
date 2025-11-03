@@ -56,6 +56,12 @@ class RunCreate(BaseModel):
         description="Whether to include subgraph events in streaming. When True, includes events from all subgraphs. When False (default when None), excludes subgraph events. Defaults to False for backwards compatibility.",
     )
 
+    # Webhook configuration
+    webhook: str | None = Field(
+        None,
+        description="Webhook URL to POST run results to when execution completes, fails, or is cancelled.",
+    )
+
     @model_validator(mode="after")
     def validate_input_command_exclusivity(self) -> Self:
         """Ensure input and command are mutually exclusive"""

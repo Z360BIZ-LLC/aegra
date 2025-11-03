@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install FastAPI and uvicorn
+RUN pip install --no-cache-dir fastapi uvicorn[standard]
+
+# Copy the webhook receiver script
+COPY test_webhook_receiver.py .
+
+# Create webhook logs directory
+RUN mkdir -p /app/webhook_logs
+
+# Expose port
+EXPOSE 8002
+
+# Run the webhook receiver
+CMD ["python", "test_webhook_receiver.py"]

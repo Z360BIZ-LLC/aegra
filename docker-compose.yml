@@ -33,7 +33,7 @@ services:
       - DEBUG=true
       - PORT=${PORT:-8000}
       - UV_CACHE_DIR=/tmp/uv-cache
-      - API_BASE_URL=http://localhost:8000 # Points to mock API on host
+      - API_BASE_URL=http://mock:8003 # Points to mock API on host
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,7 +53,35 @@ services:
         echo 'Starting Aegra server...' &&
         uv run uvicorn src.agent_server.main:app --host 0.0.0.0 --port $${PORT:-8000} --reload
       "
+  webhook-receiver:
+    build:
+      context: .
+      dockerfile: Dockerfile.webhook
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./test_webhook_receiver.py:/app/test_webhook_receiver.py:ro
+      - ./webhook_logs:/app/webhook_logs
 
+  mock:
+      build:
+        context: ../../..
+        dockerfile: dev/mock/Dockerfile
+      env_file:
+        - ../../../.env 
+      ports:
+        - "${MOCK_PORT:-8003}:8003"
+      volumes:
+        # Mount database files for easy editing during development
+        - ../../../dev/database:/app/dev/database
+        # Mount webhook data directory for easy access to saved webhook files
+        - ../../../dev/webhook_data:/app/webhook_data
+      healthcheck:
+        test: ["CMD", "curl", "-f", "http://localhost:8003/check-status"]
+        interval: 30s
+        timeout: 3s
+        retries: 3
+      restart: unless-stopped
   # Redis (optional - for advanced queuing in future phases)
   redis:
     image: redis:7-alpine

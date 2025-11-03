@@ -27,3 +27,5 @@ htmlcov/
 
 # Pre-commit
 .pre-commit-cache/
+
+/webhook_logs/
