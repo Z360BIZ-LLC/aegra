@@ -42,29 +42,33 @@ class DoubleEncodedJSONMiddleware:
                                 decoded = body.decode("utf-8")
                                 parsed = json.loads(decoded)
 
+                                # Only process if actually double-encoded
                                 if isinstance(parsed, str):
+                                    # Unwrap the double-encoded JSON
                                     parsed = json.loads(parsed)
+                                    # Re-encode the corrected data
+                                    new_body = json.dumps(parsed).encode("utf-8")
 
-                                new_body = json.dumps(parsed).encode("utf-8")
+                                    if (
+                                        b"content-type" in headers
+                                        and content_type != "application/json"
+                                    ):
+                                        new_headers = []
+                                        for name, value in scope.get("headers", []):
+                                            if name != b"content-type":
+                                                new_headers.append((name, value))
+                                        new_headers.append(
+                                            (b"content-type", b"application/json")
+                                        )
+                                        scope["headers"] = new_headers
 
-                                if (
-                                    b"content-type" in headers
-                                    and content_type != "application/json"
-                                ):
-                                    new_headers = []
-                                    for name, value in scope.get("headers", []):
-                                        if name != b"content-type":
-                                            new_headers.append((name, value))
-                                    new_headers.append(
-                                        (b"content-type", b"application/json")
-                                    )
-                                    scope["headers"] = new_headers
-
-                                return {
-                                    "type": "http.request",
-                                    "body": new_body,
-                                    "more_body": False,
-                                }
+                                    return {
+                                        "type": "http.request",
+                                        "body": new_body,
+                                        "more_body": False,
+                                    }
+                                # If not double-encoded, pass through unchanged
+                                # This prevents corruption of large/complex payloads
                             except (
                                 json.JSONDecodeError,
                                 ValueError,
