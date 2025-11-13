@@ -66,6 +66,10 @@ COPY agents/text/aegra/src/ ./src/
 COPY agents/text/src/ ./src/
 COPY agents/text/aegra/deployments/docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Create writable cache directories for non-root user
+RUN mkdir -p /tmp/composio-cache && chown -R app:app /tmp/composio-cache
+
 EXPOSE 8000
 
 # Run as non-root
