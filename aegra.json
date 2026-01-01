@@ -2,6 +2,8 @@
   "graphs": {
     "slow_agent": "./src/text_agent/graph.py:graph",
     "slow_ability_engine": "./src/text_agent/ability_engine/engine.py:graph",
-    "askz_agent": "./src/askz_agent/askz_graph.py:graph"
+    "askz_agent": "./src/askz_agent/askz_graph.py:graph",
+    "sales_agent": "./src/sales_agent/graph.py:graph"
+
   }
 }
