@@ -531,7 +531,7 @@ async def join_run(
     task = active_runs.get(run_id)
     if task:
         try:
-            await asyncio.wait_for(task, timeout=30.0)
+            await asyncio.wait_for(task, timeout=500.0)
         except TimeoutError:
             # Task is taking too long, but that's okay - we'll check DB status
             pass
