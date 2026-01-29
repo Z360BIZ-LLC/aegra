@@ -5,6 +5,7 @@
     "askz_agent": "./src/askz_agent/askz_graph.py:graph",
     "sales_agent": "./src/sales_agent/graph.py:graph",
     "evaluator_agent": "./src/evaluator_agent/graph.py:graph",
-    "ability_testing_agent": "./src/ability_testing_agent/graph.py:graph"
+    "ability_testing_agent": "./src/ability_testing_agent/graph.py:graph",
+    "session_name_agent": "./src/session_name_agent/graph.py:graph"
   }
 }
