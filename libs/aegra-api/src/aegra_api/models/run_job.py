@@ -52,6 +52,7 @@ class RunBehavior(BaseModel):
     interrupt_after: str | list[str] | None = None
     multitask_strategy: str | None = None
     subgraphs: bool = False
+    webhook_url: str | None = None
 
 
 class RunJob(BaseModel):

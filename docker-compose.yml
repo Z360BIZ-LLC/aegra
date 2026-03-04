@@ -3,14 +3,16 @@ services:
   postgres:
     image: pgvector/pgvector:pg18
     restart: unless-stopped
-    env_file:
-      - .env
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: aegra
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      test: ["CMD-SHELL", "pg_isready -U user -d aegra"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -18,16 +20,22 @@ services:
   # Aegra Server
   aegra:
     build:
-      context: .
-      dockerfile: deployments/docker/Dockerfile
+      context: ../../.. # agent-layer root (to access packages/common)
+      dockerfile: agents/text/aegra/deployments/docker/Dockerfile
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # Linux support for host access
     ports:
-      - "${PORT:-2026}:${PORT:-2026}"
+      - "${PORT:-8000}:${PORT:-8000}"
     env_file:
-      - .env
+      - ../../../.env # Load env from agent-layer root
     environment:
-      - POSTGRES_HOST=postgres
-      - PYTHONPATH=/app/src
+      - DATABASE_URL=postgresql+asyncpg://user:password@postgres:5432/aegra
+      - AUTH_TYPE=noop
+      - DEBUG=true
+      - PORT=${PORT:-8000}
+      - UV_CACHE_DIR=/tmp/uv-cache
+      - API_BASE_URL=http://mock:8003 # Points to mock API
       - REDIS_BROKER_ENABLED=true
       - REDIS_URL=redis://redis:6379/0
       - WORKER_COUNT=3
@@ -38,17 +46,64 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:$${PORT:-2026}/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:$${PORT:-8000}/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
     volumes:
       - ./aegra.json:/app/aegra.json:ro
-      - ./examples:/app/examples:ro
-      - ./libs/aegra-api/src:/app/src:ro  # Mount full src for PYTHONPATH to work
-      - ./libs/aegra-api/alembic:/app/alembic:ro # for migrations
-    command: ["uvicorn", "aegra_api.main:app", "--host", "0.0.0.0", "--port", "${PORT:-2026}", "--reload"]
+      - ./libs/aegra-api/alembic:/app/alembic:ro # For migrations
+      # Mount aegra server source for hot reload
+      - ./libs/aegra-api/src/aegra_api:/app/src/aegra_api:ro
+      # Mount your custom graphs for hot reload (separate subdirectories)
+      - ../src/text_agent:/app/src/text_agent:ro
+      - ../src/askz_agent:/app/src/askz_agent:ro
+      - ../src/sales_agent:/app/src/sales_agent:ro
+      - ../src/evaluator_agent:/app/src/evaluator_agent:ro
+      - ../src/ability_testing_agent:/app/src/ability_testing_agent:ro
+      - ../src/session_name_agent:/app/src/session_name_agent:ro
+      # Mount packages/common for hot reload
+      - ../../../packages/common:/app/packages/common:ro
+    command: >
+      sh -c "
+        echo 'Running database migrations...' &&
+        alembic upgrade head &&
+        echo 'Starting Aegra server...' &&
+        uvicorn aegra_api.main:app --host 0.0.0.0 --port $${PORT:-8000} --reload
+      "
+
+  # Webhook receiver for testing
+  webhook-receiver:
+    build:
+      context: .
+      dockerfile: Dockerfile.webhook
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./test_webhook_receiver.py:/app/test_webhook_receiver.py:ro
+      - ./webhook_logs:/app/webhook_logs
+
+  # Mock API server
+  mock:
+    build:
+      context: ../../..
+      dockerfile: dev/mock/Dockerfile
+    env_file:
+      - ../../../.env
+    ports:
+      - "${MOCK_PORT:-8003}:8003"
+    volumes:
+      # Mount database files for easy editing during development
+      - ../../../dev/database:/app/dev/database
+      # Mount webhook data directory for easy access to saved webhook files
+      - ../../../dev/webhook_data:/app/webhook_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/check-status"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
 
   # Redis - enables multi-instance SSE streaming with pub/sub + replay
   redis:

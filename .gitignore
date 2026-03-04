@@ -36,3 +36,6 @@ htmlcov/
 
 # Claude
 .claude/
+
+# Webhook logs
+/webhook_logs/

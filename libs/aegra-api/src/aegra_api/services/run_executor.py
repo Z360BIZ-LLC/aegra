@@ -20,6 +20,7 @@ from aegra_api.services.graph_streaming import stream_graph_events
 from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
 from aegra_api.services.run_status import finalize_run, update_run_status
 from aegra_api.services.streaming_service import streaming_service
+from aegra_api.services.webhook_service import send_run_webhook
 from aegra_api.settings import settings
 from aegra_api.utils.run_utils import map_command_to_langgraph
 
@@ -61,6 +62,7 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="interrupted",
                 output=final_output.data,
             )
+            await _send_run_webhook(job, "interrupted", final_output.data)
         else:
             await finalize_run(
                 run_id,
@@ -69,6 +71,7 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="idle",
                 output=final_output.data,
             )
+            await _send_run_webhook(job, "completed", final_output.data)
 
     except asyncio.CancelledError:
         if run_id in _lease_loss_cancellations:
@@ -79,12 +82,14 @@ async def execute_run(job: RunJob) -> None:
             logger.info("Lease-loss cancel, skipping finalize", run_id=run_id)
         else:
             await finalize_run(run_id, thread_id, status="interrupted", thread_status="idle", output={})
+            await _send_run_webhook(job, "cancelled", {})
             await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
         raise
     except Exception as exc:
         logger.exception("Run failed", run_id=run_id)
         safe_message = f"{type(exc).__name__}: execution failed"
         await finalize_run(run_id, thread_id, status="error", thread_status="error", output={}, error=str(exc))
+        await _send_run_webhook(job, "failed", {}, error_message=str(exc))
         await _best_effort_signal(streaming_service.signal_run_error, run_id, safe_message, type(exc).__name__)
     else:
         status = "interrupted" if final_output.has_interrupt else "success"
@@ -112,6 +117,23 @@ async def _best_effort_signal(fn: Any, *args: Any) -> None:
         await fn(*args)
     except Exception:
         logger.warning("Signal failed (best-effort, DB status already committed)", fn=fn.__name__)
+
+
+async def _send_run_webhook(
+    job: RunJob,
+    status: str,
+    output: dict[str, Any],
+    error_message: str | None = None,
+) -> None:
+    """Send a completion webhook when the caller supplied a webhook URL."""
+    await send_run_webhook(
+        webhook_url=job.behavior.webhook_url,
+        run_id=job.identity.run_id,
+        thread_id=job.identity.thread_id,
+        status=status,
+        output=output,
+        error_message=error_message,
+    )
 
 
 class _GraphResult:

@@ -1,15 +1,13 @@
 {
-  "dependencies": ["./examples"],
   "graphs": {
-    "agent": "./examples/react_agent/graph.py:graph",
-    "agent_hitl": "./examples/react_agent_hitl/graph.py:graph",
-    "subgraph_agent": "./examples/subgraph_agent/graph.py:graph",
-    "subgraph_hitl_agent": "./examples/subgraph_hitl_agent/graph.py:graph",
-    "factory": "./examples/factory/graph.py:graph",
-    "stress_test": "./examples/stress_test/graph.py:graph",
-    "stress_tool_agent": "./examples/stress_tool_agent/graph.py:graph"
-  },
-  "http": {
-    "app": "./examples/custom_routes_example.py:app"
+    "slow_agent": "./src/text_agent/graph.py:graph",
+    "slow_ability_engine": "./src/text_agent/ability_engine/engine.py:graph",
+    "askz_agent": "./src/askz_agent/graph.py:graph",
+    "sales_agent": "./src/sales_agent/graph.py:graph",
+    "evaluator_agent": "./src/evaluator_agent/graph.py:graph",
+    "ability_testing_agent": "./src/ability_testing_agent/graph.py:graph",
+    "session_name_agent": "./src/session_name_agent/graph.py:graph",
+    "ability_builder": "./src/askz_agent/ability_builder/graph.py:graph",
+    "pipeline_builder": "./src/askz_agent/pipeline_builder/graph.py:graph"
   }
 }

@@ -236,6 +236,7 @@ async def _prepare_run(
             interrupt_after=request.interrupt_after,
             multitask_strategy=request.multitask_strategy,
             subgraphs=request.stream_subgraphs or False,
+            webhook_url=request.webhook,
         ),
     )
 
