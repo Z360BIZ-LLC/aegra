@@ -10,7 +10,10 @@ requires-python = ">=3.12"
 package = false
 
 [tool.uv.workspace]
-members = ["libs/*"]
+members = ["libs/*", "packages/common"]
+
+[tool.uv.sources]
+agent-layer-common = { workspace = true }
 
 [dependency-groups]
 dev = [

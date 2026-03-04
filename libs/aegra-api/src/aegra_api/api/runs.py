@@ -29,6 +29,7 @@ from aegra_api.services.broker import broker_manager
 from aegra_api.services.graph_streaming import stream_graph_events
 from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
 from aegra_api.services.streaming_service import streaming_service
+from aegra_api.services.webhook_service import send_run_webhook
 from aegra_api.utils.assistants import resolve_assistant_id
 from aegra_api.utils.run_utils import (
     _merge_jsonb,
@@ -276,6 +277,7 @@ async def create_run(
             request.interrupt_after,
             request.multitask_strategy,
             request.stream_subgraphs,
+            request.webhook,
         )
     )
     logger.info(f"[create_run] background task created task_id={id(task)} for run_id={run_id}")
@@ -397,6 +399,7 @@ async def create_and_stream_run(
             request.interrupt_after,
             request.multitask_strategy,
             request.stream_subgraphs,
+            request.webhook,
         )
     )
     logger.info(f"[create_and_stream_run] background task created task_id={id(task)} for run_id={run_id}")
@@ -588,7 +591,7 @@ async def join_run(
     task = active_runs.get(run_id)
     if task:
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=30.0)
+            await asyncio.wait_for(asyncio.shield(task), timeout=500.0)
         except TimeoutError:
             pass
         except asyncio.CancelledError:
@@ -720,6 +723,7 @@ async def wait_for_run(
             request.interrupt_after,
             request.multitask_strategy,
             request.stream_subgraphs,
+            request.webhook,
         )
     )
     logger.info(f"[wait_for_run] background task created task_id={id(task)} for run_id={run_id}")
@@ -908,6 +912,7 @@ async def execute_run_async(
     interrupt_after: str | list[str] | None = None,
     _multitask_strategy: str | None = None,
     subgraphs: bool | None = False,
+    webhook_url: str | None = None,
 ) -> None:
     """Execute run asynchronously in background using streaming to capture all events."""
     owns_session = session is None
@@ -1020,6 +1025,14 @@ async def execute_run_async(
             if not session:
                 raise RuntimeError(f"No database session available to update thread {thread_id} status")
             await set_thread_status(session, thread_id, "interrupted")
+            # Send webhook notification
+            await send_run_webhook(
+                webhook_url=webhook_url,
+                run_id=run_id,
+                thread_id=thread_id,
+                status="interrupted",
+                output=final_output or {},
+            )
 
         else:
             # Update with results - use standard status
@@ -1028,6 +1041,14 @@ async def execute_run_async(
             if not session:
                 raise RuntimeError(f"No database session available to update thread {thread_id} status")
             await set_thread_status(session, thread_id, "idle")
+            # Send webhook notification
+            await send_run_webhook(
+                webhook_url=webhook_url,
+                run_id=run_id,
+                thread_id=thread_id,
+                status="completed",
+                output=final_output or {},
+            )
 
     except asyncio.CancelledError:
         # Store empty output to avoid JSON serialization issues - use standard status
@@ -1037,6 +1058,14 @@ async def execute_run_async(
         await set_thread_status(session, thread_id, "idle")
         # Signal cancellation to broker
         await streaming_service.signal_run_cancelled(run_id)
+        # Send webhook notification
+        await send_run_webhook(
+            webhook_url=webhook_url,
+            run_id=run_id,
+            thread_id=thread_id,
+            status="cancelled",
+            output={},
+        )
         raise
     except Exception as e:
         # Log with full traceback so bugs are visible in logs
@@ -1053,6 +1082,15 @@ async def execute_run_async(
         if broker and not broker.is_finished():
             error_type = type(e).__name__
             await streaming_service.signal_run_error(run_id, str(e), error_type)
+        # Send webhook notification
+        await send_run_webhook(
+            webhook_url=webhook_url,
+            run_id=run_id,
+            thread_id=thread_id,
+            status="failed",
+            output={},
+            error_message=str(e),
+        )
         # Don't re-raise: this runs as a background task (asyncio.create_task),
         # so re-raising causes "Task exception was never retrieved" warnings.
         # The error is already fully handled (run status, thread status, broker).

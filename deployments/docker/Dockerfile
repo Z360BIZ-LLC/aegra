@@ -27,22 +27,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy aegra-api package files and workspace lockfile
-COPY libs/aegra-api/pyproject.toml libs/aegra-api/README.md ./
-COPY uv.lock ./
+# Copy packages/common and install it first (used by our custom agents)
+# Build context is agent-layer root (../../.. from aegra)
+COPY packages/common/ ./packages/common/
+RUN uv pip install --system --compile-bytecode ./packages/common/
 
-# Install dependencies from lockfile (includes dev deps for example agents).
-RUN uv export --frozen --no-emit-project --format=requirements-txt > requirements.txt && \
-    uv pip install --system --compile-bytecode -r requirements.txt && \
-    rm requirements.txt
-
-# Copy the actual project source code and forced includes (alembic).
-COPY libs/aegra-api/src/ ./src/
-COPY libs/aegra-api/alembic.ini ./alembic.ini
-COPY libs/aegra-api/alembic/ ./alembic/
-
-# Install the project package itself.
-RUN uv pip install --system --compile-bytecode --no-deps .
+# Copy aegra-api package and install with all dependencies
+COPY agents/text/aegra/libs/aegra-api/ ./libs/aegra-api/
+RUN uv pip install --system --compile-bytecode ./libs/aegra-api/
 
 # -----------------------------
 # Final, minimal runtime image
@@ -58,16 +50,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/lib/python${PY_VERSION}/site-packages/ /usr/local/lib/python${PY_VERSION}/site-packages/
 COPY --from=builder /usr/local/bin/ /usr/local/bin/
 
-# Copy runtime assets required by the app and alembic
-COPY libs/aegra-api/alembic.ini ./alembic.ini
-COPY libs/aegra-api/alembic/ ./alembic/
-COPY aegra.json ./aegra.json
-COPY examples/ ./examples/
+# Copy packages/common (needed for agents/vector_store module imports)
+COPY packages/common/ ./packages/common/
+
+# Add packages/common to PYTHONPATH
+ENV PYTHONPATH="/app/packages/common:${PYTHONPATH}"
+
+# Copy runtime assets required by the app and alembic (from aegra submodule)
+COPY agents/text/aegra/libs/aegra-api/alembic.ini ./alembic.ini
+COPY agents/text/aegra/libs/aegra-api/alembic/ ./alembic/
+COPY agents/text/aegra/aegra.json ./aegra.json
+
+# Copy your custom graphs to src/ (contains text_agent/, askz_agent/, etc. — no conflict with aegra_api/)
+COPY agents/text/src/ ./src/
+
+# Create writable cache directories for non-root user
+RUN mkdir -p /tmp/composio-cache && chown -R app:app /tmp/composio-cache
 
 EXPOSE 8000
 
 # Run as non-root
 USER app
 
-# Default command - can be overridden by docker-compose
+# Start server (aegra auto-runs migrations in app lifespan)
 CMD ["uvicorn", "aegra_api.main:app", "--host", "0.0.0.0", "--port", "8000"]

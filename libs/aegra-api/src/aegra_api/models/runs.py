@@ -70,6 +70,12 @@ class RunCreate(BaseModel):
         description="Request metadata (e.g., from_studio flag)",
     )
 
+    # Webhook configuration
+    webhook: str | None = Field(
+        None,
+        description="Webhook URL to POST run results to when execution completes, fails, or is cancelled.",
+    )
+
     @model_validator(mode="after")
     def validate_input_command_exclusivity(self) -> Self:
         """Ensure input and command are mutually exclusive"""

@@ -33,3 +33,6 @@ htmlcov/
 
 # MacOS
 .DS_Store
+
+# Webhook logs
+/webhook_logs/
