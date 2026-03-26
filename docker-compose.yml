@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d aegra"]
+      test: [ "CMD-SHELL", "pg_isready -U user -d aegra" ]
       interval: 5s
       timeout: 5s
       retries: 5
