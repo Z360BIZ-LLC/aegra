@@ -34,7 +34,7 @@ async def receive_webhook(request: Request):
     with open(filepath, 'w') as f:
         json.dump(payload, f, indent=2)
 
-    print(payload)
+
     print("\n" + "=" * 60)
     print("WEBHOOK RECEIVED!")
     print("=" * 60)
@@ -44,9 +44,6 @@ async def receive_webhook(request: Request):
     print(f"Timestamp: {payload.get('webhook_sent_at')}")
     print(f"Saved to: {filepath}")
 
-    if "values" in payload and payload.get('values'):
-        print(f"\nValues (Output):")
-        print(json.dumps(payload.get('values'), indent=2))
 
     if "error" in payload:
         print(f"\nError: {payload.get('error')}")

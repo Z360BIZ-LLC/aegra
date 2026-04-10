@@ -147,6 +147,13 @@ class ObservabilitySettings(EnvBase):
     # --- Prometheus Metrics ---
     ENABLE_PROMETHEUS_METRICS: bool = False
 
+    # --- BatchSpanProcessor tuning (temporary 413 mitigation knobs) ---
+    # Keep defaults moderate (not too small) to reduce payload size per request.
+    OTEL_BSP_MAX_EXPORT_BATCH_SIZE: int = 128
+    OTEL_BSP_MAX_QUEUE_SIZE: int = 2048
+    OTEL_BSP_SCHEDULE_DELAY_MS: int = 5000
+    OTEL_BSP_EXPORT_TIMEOUT_MS: int = 30000
+
     # --- Langfuse Specifics ---
     LANGFUSE_BASE_URL: str = "http://localhost:3000"
     LANGFUSE_PUBLIC_KEY: str | None = None

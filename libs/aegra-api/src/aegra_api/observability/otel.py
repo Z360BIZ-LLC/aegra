@@ -71,6 +71,24 @@ class OpenTelemetryProvider(ObservabilityProvider):
         self._active_targets.append(target)
         self._enabled = True
 
+    def _build_batch_span_processor(self, exporter: Any) -> BatchSpanProcessor:
+        """Create a BatchSpanProcessor with bounded, configurable payload sizing."""
+        conf = settings.observability
+
+        # Enforce sane bounds to avoid invalid combinations.
+        max_export_batch_size = max(32, int(conf.OTEL_BSP_MAX_EXPORT_BATCH_SIZE))
+        max_queue_size = max(max_export_batch_size, int(conf.OTEL_BSP_MAX_QUEUE_SIZE))
+        schedule_delay_millis = max(100, int(conf.OTEL_BSP_SCHEDULE_DELAY_MS))
+        export_timeout_millis = max(1000, int(conf.OTEL_BSP_EXPORT_TIMEOUT_MS))
+
+        return BatchSpanProcessor(
+            exporter,
+            max_queue_size=max_queue_size,
+            schedule_delay_millis=schedule_delay_millis,
+            max_export_batch_size=max_export_batch_size,
+            export_timeout_millis=export_timeout_millis,
+        )
+
     def setup(self) -> None:
         """Initializes the Global Tracer Provider. Runs once."""
         if self._tracer_provider:
@@ -94,7 +112,7 @@ class OpenTelemetryProvider(ObservabilityProvider):
             try:
                 exporter = target.get_exporter()
                 if exporter:
-                    processor = BatchSpanProcessor(exporter)
+                    processor = self._build_batch_span_processor(exporter)
                     self._tracer_provider.add_span_processor(processor)
                     processors_count += 1
                     logger.info(f"Observability: Attached target '{target.name}'")
@@ -103,7 +121,9 @@ class OpenTelemetryProvider(ObservabilityProvider):
 
         # 3. Console Exporter
         if settings.observability.OTEL_CONSOLE_EXPORT:
-            self._tracer_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+            self._tracer_provider.add_span_processor(
+                self._build_batch_span_processor(ConsoleSpanExporter())
+            )
             processors_count += 1
             logger.info("Observability: Console export enabled")
 
