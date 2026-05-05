@@ -7,6 +7,7 @@ Single source of truth for executing a graph run. Both LocalExecutor
 """
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -62,7 +63,12 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="interrupted",
                 output=final_output.data,
             )
-            await _send_run_webhook(job, "interrupted", final_output.data)
+            await _send_run_webhook(
+                job,
+                "interrupted",
+                final_output.data,
+                message_timestamps=final_output.message_timestamps,
+            )
         else:
             await finalize_run(
                 run_id,
@@ -71,7 +77,12 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="idle",
                 output=final_output.data,
             )
-            await _send_run_webhook(job, "completed", final_output.data)
+            await _send_run_webhook(
+                job,
+                "completed",
+                final_output.data,
+                message_timestamps=final_output.message_timestamps,
+            )
 
     except asyncio.CancelledError:
         if run_id in _lease_loss_cancellations:
@@ -123,6 +134,7 @@ async def _send_run_webhook(
     job: RunJob,
     status: str,
     output: dict[str, Any],
+    message_timestamps: dict[str, str] | None = None,
     error_message: str | None = None,
 ) -> None:
     """Send a completion webhook when the caller supplied a webhook URL."""
@@ -132,6 +144,7 @@ async def _send_run_webhook(
         thread_id=job.identity.thread_id,
         status=status,
         output=output,
+        message_timestamps=message_timestamps,
         error_message=error_message,
     )
 
@@ -139,11 +152,40 @@ async def _send_run_webhook(
 class _GraphResult:
     """Accumulates output and interrupt state during graph streaming."""
 
-    __slots__ = ("data", "has_interrupt")
+    __slots__ = ("data", "has_interrupt", "message_timestamps")
 
     def __init__(self) -> None:
         self.data: dict[str, Any] = {}
         self.has_interrupt: bool = False
+        self.message_timestamps: dict[str, str] = {}
+
+
+def _get_message_id(message: Any) -> str | None:
+    """Return a stable message ID when available."""
+    if isinstance(message, dict):
+        message_id = message.get("id")
+        return str(message_id) if message_id else None
+
+    message_id = getattr(message, "id", None)
+    return str(message_id) if message_id else None
+
+
+def _record_message_timestamps(
+    values_payload: dict[str, Any],
+    message_timestamps: dict[str, str],
+    *,
+    observed_at: datetime | None = None,
+) -> None:
+    """Stamp each newly observed message with its first-seen UTC time."""
+    messages = values_payload.get("messages")
+    if not isinstance(messages, list):
+        return
+
+    timestamp = (observed_at or datetime.now(UTC)).isoformat()
+    for message in messages:
+        message_id = _get_message_id(message)
+        if message_id and message_id not in message_timestamps:
+            message_timestamps[message_id] = timestamp
 
 
 async def _stream_graph(job: RunJob) -> _GraphResult:
@@ -183,6 +225,7 @@ async def _stream_graph(job: RunJob) -> _GraphResult:
                 result.has_interrupt = True
             if event_type.startswith("values"):
                 result.data = event_data
+                _record_message_timestamps(event_data, result.message_timestamps)
 
     return result
 

@@ -13,6 +13,31 @@ logger = logging.getLogger(__name__)
 serializer = GeneralSerializer()
 
 
+def _attach_message_timestamps(
+    serialized_output: dict[str, Any] | None,
+    message_timestamps: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    """Add per-message UTC timestamps to webhook output messages."""
+    if not serialized_output or not message_timestamps:
+        return serialized_output
+
+    messages = serialized_output.get("messages")
+    if not isinstance(messages, list):
+        return serialized_output
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        message_id = message.get("id")
+        if not message_id:
+            continue
+        created_at = message_timestamps.get(str(message_id))
+        if created_at:
+            message["created_at"] = created_at
+
+    return serialized_output
+
+
 class WebhookService:
     """Service to handle webhook callbacks for run completions"""
 
@@ -44,6 +69,7 @@ class WebhookService:
         thread_id: str,
         status: str,
         output: dict[str, Any] | None = None,
+        message_timestamps: dict[str, str] | None = None,
         error_message: str | None = None,
         max_retries: int = 3,
     ) -> bool:
@@ -70,6 +96,10 @@ class WebhookService:
         if output is not None:
             try:
                 serialized_output = serializer.serialize(output)
+                serialized_output = _attach_message_timestamps(
+                    serialized_output,
+                    message_timestamps,
+                )
             except Exception as e:
                 logger.warning(f"[webhook] Failed to serialize output for run_id={run_id}: {e}")
                 serialized_output = {
@@ -155,6 +185,7 @@ async def send_run_webhook(
     thread_id: str,
     status: str,
     output: dict[str, Any] | None = None,
+    message_timestamps: dict[str, str] | None = None,
     error_message: str | None = None,
 ) -> None:
     """
@@ -170,6 +201,7 @@ async def send_run_webhook(
                 thread_id=thread_id,
                 status=status,
                 output=output,
+                message_timestamps=message_timestamps,
                 error_message=error_message,
             )
         )
