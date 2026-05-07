@@ -1,7 +1,6 @@
 """Unit tests for run_executor service."""
 
 import asyncio
-from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -71,41 +70,6 @@ class TestExecuteRunSuccess:
         assert mock_finalize.await_args.kwargs["status"] == "success"
 
         mock_signal_end.assert_awaited_once_with("run-1", "success")
-
-
-class TestRecordMessageTimestamps:
-    def test_records_first_seen_ids_once(self) -> None:
-        """Messages are stamped when first observed and keep their original time."""
-        from aegra_api.services.run_executor import _record_message_timestamps
-
-        observed_at = datetime(2026, 5, 5, 10, 0, 0, tzinfo=UTC)
-        message_timestamps: dict[str, str] = {}
-
-        _record_message_timestamps(
-            {
-                "messages": [
-                    {"id": "msg-1", "content": "hello"},
-                    {"id": "msg-2", "content": "hi"},
-                ]
-            },
-            message_timestamps,
-            observed_at=observed_at,
-        )
-        _record_message_timestamps(
-            {
-                "messages": [
-                    {"id": "msg-1", "content": "hello again"},
-                    {"id": "msg-2", "content": "hi again"},
-                ]
-            },
-            message_timestamps,
-            observed_at=datetime(2026, 5, 5, 10, 0, 5, tzinfo=UTC),
-        )
-
-        assert message_timestamps == {
-            "msg-1": "2026-05-05T10:00:00+00:00",
-            "msg-2": "2026-05-05T10:00:00+00:00",
-        }
 
 
 class TestExecuteRunCancelledError:

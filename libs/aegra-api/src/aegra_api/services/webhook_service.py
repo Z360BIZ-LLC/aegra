@@ -6,19 +6,65 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+import structlog
 
 from aegra_api.core.serializers import GeneralSerializer
 
 logger = logging.getLogger(__name__)
+struct_logger = structlog.get_logger(__name__)
 serializer = GeneralSerializer()
 
 
-def _attach_message_timestamps(
-    serialized_output: dict[str, Any] | None,
-    message_timestamps: dict[str, str] | None,
-) -> dict[str, Any] | None:
-    """Add per-message UTC timestamps to webhook output messages."""
-    if not serialized_output or not message_timestamps:
+def _get_additional_kwargs(message: Any) -> dict[str, Any] | None:
+    """Return ``additional_kwargs`` from a dict- or BaseMessage-shaped message.
+
+    Aegra serializes graph output before this runs, so messages are
+    expected to be dicts. We also support attribute access to remain
+    resilient to non-serialized shapes.
+    """
+    if isinstance(message, dict):
+        kwargs = message.get("additional_kwargs")
+        return kwargs if isinstance(kwargs, dict) else None
+
+    kwargs = getattr(message, "additional_kwargs", None)
+    return kwargs if isinstance(kwargs, dict) else None
+
+
+def _get_message_field(message: Any, key: str) -> Any:
+    """Read a field from a dict- or BaseMessage-shaped message."""
+    if isinstance(message, dict):
+        return message.get(key)
+    return getattr(message, key, None)
+
+
+def _set_message_field(message: Any, key: str, value: Any) -> None:
+    """Set a field on a dict- or BaseMessage-shaped message."""
+    if isinstance(message, dict):
+        message[key] = value
+        return
+    try:
+        setattr(message, key, value)
+    except (AttributeError, TypeError):
+        # Some immutable shapes can't accept new attributes; skip silently —
+        # the dict path handles all serialized output, which is the
+        # production path.
+        struct_logger.warning(
+            "webhook.message_created_at.unwritable",
+            message_type=type(message).__name__,
+        )
+
+
+def _promote_graph_created_at(serialized_output: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Promote ``additional_kwargs.created_at`` to a top-level ``created_at``.
+
+    Reads the timestamp the graph stamped on each message at creation time.
+    If a message lacks ``additional_kwargs.created_at``, we log a warning
+    (so the missing stamp stays debuggable) AND fall back to an
+    observation-time ``datetime.now(UTC)`` so the webhook payload always
+    has a ``created_at`` field for downstream consumers. The fallback is
+    inaccurate by definition — graph stamping remains the source of truth.
+    """
+    if not serialized_output:
         return serialized_output
 
     messages = serialized_output.get("messages")
@@ -26,14 +72,18 @@ def _attach_message_timestamps(
         return serialized_output
 
     for message in messages:
-        if not isinstance(message, dict):
-            continue
-        message_id = message.get("id")
-        if not message_id:
-            continue
-        created_at = message_timestamps.get(str(message_id))
+        kwargs = _get_additional_kwargs(message)
+        created_at = kwargs.get("created_at") if kwargs else None
         if created_at:
-            message["created_at"] = created_at
+            _set_message_field(message, "created_at", created_at)
+            continue
+
+        struct_logger.warning(
+            "webhook.message_created_at.missing",
+            message_id=_get_message_field(message, "id"),
+            message_type=_get_message_field(message, "type"),
+        )
+        _set_message_field(message, "created_at", datetime.now(UTC).isoformat())
 
     return serialized_output
 
@@ -69,7 +119,6 @@ class WebhookService:
         thread_id: str,
         status: str,
         output: dict[str, Any] | None = None,
-        message_timestamps: dict[str, str] | None = None,
         error_message: str | None = None,
         max_retries: int = 3,
     ) -> bool:
@@ -96,10 +145,7 @@ class WebhookService:
         if output is not None:
             try:
                 serialized_output = serializer.serialize(output)
-                serialized_output = _attach_message_timestamps(
-                    serialized_output,
-                    message_timestamps,
-                )
+                serialized_output = _promote_graph_created_at(serialized_output)
             except Exception as e:
                 logger.warning(f"[webhook] Failed to serialize output for run_id={run_id}: {e}")
                 serialized_output = {
@@ -169,9 +215,7 @@ class WebhookService:
             if attempt < max_retries - 1:
                 await asyncio.sleep(2**attempt)
 
-        logger.error(
-            f"[webhook] Failed to deliver webhook for run_id={run_id} after {max_retries} attempts"
-        )
+        logger.error(f"[webhook] Failed to deliver webhook for run_id={run_id} after {max_retries} attempts")
         return False
 
 
@@ -185,7 +229,6 @@ async def send_run_webhook(
     thread_id: str,
     status: str,
     output: dict[str, Any] | None = None,
-    message_timestamps: dict[str, str] | None = None,
     error_message: str | None = None,
 ) -> None:
     """
@@ -201,7 +244,6 @@ async def send_run_webhook(
                 thread_id=thread_id,
                 status=status,
                 output=output,
-                message_timestamps=message_timestamps,
                 error_message=error_message,
             )
         )
