@@ -8,6 +8,7 @@
     "ability_testing_agent": "./src/ability_testing_agent/graph.py:graph",
     "session_name_agent": "./src/session_name_agent/graph.py:graph",
     "ability_builder": "./src/askz_agent/ability_builder/graph.py:graph",
-    "pipeline_builder": "./src/askz_agent/pipeline_builder/graph.py:graph"
+    "pipeline_builder": "./src/askz_agent/pipeline_builder/graph.py:graph",
+    "deep_agent": "./src/deep_agent/agent.py:graph"
   }
 }
