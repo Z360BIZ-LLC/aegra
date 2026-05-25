@@ -3,10 +3,12 @@
 import asyncio
 import logging
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any
 
 import httpx
 import structlog
+from observability.cloudwatch_emf import emit_metric
 
 from aegra_api.core.serializers import GeneralSerializer
 
@@ -140,6 +142,10 @@ class WebhookService:
         if not webhook_url:
             return False
 
+        started_at = perf_counter()
+        last_failure_class: str | None = None
+        last_status_code: int | None = None
+
         # Serialize output to ensure JSON compatibility
         serialized_output = None
         if output is not None:
@@ -192,21 +198,35 @@ class WebhookService:
                     logger.info(
                         f"[webhook] Successfully delivered webhook for run_id={run_id} (status_code={response.status_code})"
                     )
+                    _emit_webhook_metrics(
+                        "success",
+                        started_at,
+                        run_id=run_id,
+                        thread_id=thread_id,
+                        run_status=status,
+                        attempts=attempt + 1,
+                        status_code=response.status_code,
+                    )
                     return True
                 else:
+                    last_status_code = response.status_code
+                    last_failure_class = "non_success_status"
                     logger.warning(
                         f"[webhook] Webhook returned non-success status for run_id={run_id}: {response.status_code}"
                     )
 
             except httpx.TimeoutException:
+                last_failure_class = "timeout"
                 logger.warning(
                     f"[webhook] Timeout delivering webhook for run_id={run_id} (attempt {attempt + 1}/{max_retries})"
                 )
             except httpx.HTTPError as e:
+                last_failure_class = type(e).__name__
                 logger.warning(
                     f"[webhook] HTTP error delivering webhook for run_id={run_id}: {e} (attempt {attempt + 1}/{max_retries})"
                 )
             except Exception as e:
+                last_failure_class = type(e).__name__
                 logger.error(
                     f"[webhook] Unexpected error delivering webhook for run_id={run_id}: {e} (attempt {attempt + 1}/{max_retries})"
                 )
@@ -216,11 +236,62 @@ class WebhookService:
                 await asyncio.sleep(2**attempt)
 
         logger.error(f"[webhook] Failed to deliver webhook for run_id={run_id} after {max_retries} attempts")
+        _emit_webhook_metrics(
+            "failure",
+            started_at,
+            run_id=run_id,
+            thread_id=thread_id,
+            run_status=status,
+            attempts=max_retries,
+            status_code=last_status_code,
+            failure_class=last_failure_class,
+        )
         return False
 
 
 # Global singleton instance
 webhook_service = WebhookService()
+
+# Keep a hard reference to every in-flight webhook task so the asyncio event
+# loop cannot garbage-collect it mid-delivery. asyncio.create_task only holds
+# a weak reference; without this set, a task whose only reference is the
+# coroutine itself can be silently dropped under GC pressure, which would
+# cause webhook delivery (and its emitted metrics) to disappear.
+_inflight_webhook_tasks: set[asyncio.Task[bool]] = set()
+
+
+def _emit_webhook_metrics(
+    outcome: str,
+    started_at: float,
+    *,
+    run_id: str,
+    thread_id: str,
+    run_status: str,
+    attempts: int,
+    status_code: int | None = None,
+    failure_class: str | None = None,
+) -> None:
+    """Emit webhook outcome and latency metrics without affecting delivery."""
+    properties = {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "run_status": run_status,
+        "attempts": attempts,
+    }
+    if status_code is not None:
+        properties["status_code"] = status_code
+    if failure_class is not None:
+        properties["failure_class"] = failure_class
+
+    metric_name = "WebhookDeliverySucceeded" if outcome == "success" else "WebhookDeliveryFailed"
+    emit_metric(metric_name, 1, properties=properties)
+    emit_metric(
+        "WebhookDeliveryLatencyMs",
+        max(0.0, (perf_counter() - started_at) * 1000),
+        unit="Milliseconds",
+        dimensions={"Outcome": outcome},
+        properties=properties,
+    )
 
 
 async def send_run_webhook(
@@ -236,8 +307,8 @@ async def send_run_webhook(
     Safe to call with None webhook_url (will be ignored).
     """
     if webhook_url:
-        # Fire and forget - don't block on webhook delivery
-        asyncio.create_task(
+        # Fire and forget - don't block on webhook delivery.
+        task = asyncio.create_task(
             webhook_service.send_webhook(
                 webhook_url=webhook_url,
                 run_id=run_id,
@@ -247,3 +318,5 @@ async def send_run_webhook(
                 error_message=error_message,
             )
         )
+        _inflight_webhook_tasks.add(task)
+        task.add_done_callback(_inflight_webhook_tasks.discard)

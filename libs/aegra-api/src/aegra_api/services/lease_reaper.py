@@ -11,6 +11,7 @@ import contextlib
 from datetime import UTC, datetime, timedelta
 
 import structlog
+from observability.cloudwatch_emf import emit_metric
 from redis import RedisError
 from sqlalchemy import select, update
 
@@ -72,13 +73,19 @@ class LeaseReaper:
                 retryable, exhausted = await self._check_retry_limits(actually_reset)
                 if exhausted:
                     await self._mark_permanently_failed(exhausted)
+                    for run_id in exhausted:
+                        emit_metric("RunMaxRetriesExceeded", 1, properties={"run_id": run_id})
                 if retryable:
                     await self._reenqueue(retryable)
+                    for run_id in retryable:
+                        emit_metric("LeaseExpiredRecovered", 1, properties={"run_id": run_id})
 
         # Stuck pending: just re-enqueue (never executed, no retry budget)
         if stuck_pending:
             logger.warning("Re-enqueueing stuck pending runs", count=len(stuck_pending), run_ids=stuck_pending)
             await self._reenqueue(stuck_pending)
+            for run_id in stuck_pending:
+                emit_metric("StuckPendingRequeued", 1, properties={"run_id": run_id})
 
         logger.info(
             "Lease recovery complete",
@@ -144,6 +151,8 @@ class LeaseReaper:
                 await client.rpush(queue_key, run_id)  # type: ignore[arg-type]
                 logger.info("Re-enqueued recovered run", run_id=run_id)
         except RedisError:
+            for run_id in run_ids:
+                emit_metric("RedisBrokerFallback", 1, properties={"run_id": run_id})
             logger.warning(
                 "Redis unavailable during re-enqueue; workers will pick up via Postgres poll",
                 run_ids=run_ids,

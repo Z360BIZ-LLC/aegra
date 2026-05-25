@@ -11,6 +11,7 @@ from uuid import uuid4
 import structlog
 from asgi_correlation_id import correlation_id
 from fastapi import HTTPException
+from observability.cloudwatch_emf import emit_metric
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -269,11 +270,42 @@ async def _prepare_run(
     )
     session.add(run_orm)
     await session.commit()
+    emit_metric(
+        "RunsCreated",
+        1,
+        properties={
+            "run_id": run_id,
+            "thread_id": thread_id,
+            "user_id": user.identity,
+            "graph_id": assistant.graph_id,
+            "initial_status": initial_status,
+        },
+    )
+    if request.webhook:
+        emit_metric(
+            "RunsRequestingWebhook",
+            1,
+            properties={
+                "run_id": run_id,
+                "thread_id": thread_id,
+                "graph_id": assistant.graph_id,
+            },
+        )
 
     run = Run.model_validate(run_orm)
 
     # Submit to executor
     await executor.submit(job)
+    emit_metric(
+        "RunsSubmitted",
+        1,
+        properties={
+            "run_id": run_id,
+            "thread_id": thread_id,
+            "graph_id": assistant.graph_id,
+            "initial_status": initial_status,
+        },
+    )
     logger.info("Submitted run to executor", run_id=run_id)
 
     return run_id, run, job

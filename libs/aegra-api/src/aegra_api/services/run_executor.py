@@ -7,9 +7,11 @@ Single source of truth for executing a graph run. Both LocalExecutor
 """
 
 import asyncio
+from time import perf_counter
 from typing import Any
 
 import structlog
+from observability.cloudwatch_emf import emit_metric
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_ctx import with_auth_ctx
@@ -48,9 +50,17 @@ async def execute_run(job: RunJob) -> None:
     run_id = job.identity.run_id
     thread_id = job.identity.thread_id
     is_lease_loss = False
+    # Bound for any except handler that fires before the post-status-update
+    # rebind below. If update_run_status itself raises, RunDurationMs ends up
+    # ~0 — accurate, since the graph never started.
+    started_at = perf_counter()
 
     try:
         await update_run_status(run_id, "running")
+        # Rebind so RunDurationMs measures only graph execution, not the
+        # preceding status-update DB write.
+        started_at = perf_counter()
+        _emit_run_started_metric(job)
 
         final_output = await _stream_graph(job)
 
@@ -62,6 +72,7 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="interrupted",
                 output=final_output.data,
             )
+            _emit_run_terminal_metrics(job, "interrupted", started_at)
             await _send_run_webhook(job, "interrupted", final_output.data)
         else:
             await finalize_run(
@@ -71,6 +82,7 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="idle",
                 output=final_output.data,
             )
+            _emit_run_terminal_metrics(job, "success", started_at)
             await _send_run_webhook(job, "completed", final_output.data)
 
     except asyncio.CancelledError:
@@ -80,8 +92,10 @@ async def execute_run(job: RunJob) -> None:
             # The new worker owns the run now.
             is_lease_loss = True
             logger.info("Lease-loss cancel, skipping finalize", run_id=run_id)
+            emit_metric("LeaseLossCancellation", 1, properties=_run_metric_properties(job))
         else:
             await finalize_run(run_id, thread_id, status="interrupted", thread_status="idle", output={})
+            _emit_run_terminal_metrics(job, "interrupted", started_at, terminal_reason="cancelled")
             await _send_run_webhook(job, "cancelled", {})
             await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
         raise
@@ -89,6 +103,7 @@ async def execute_run(job: RunJob) -> None:
         logger.exception("Run failed", run_id=run_id)
         safe_message = f"{type(exc).__name__}: execution failed"
         await finalize_run(run_id, thread_id, status="error", thread_status="error", output={}, error=str(exc))
+        _emit_run_terminal_metrics(job, "error", started_at, error_class=type(exc).__name__)
         await _send_run_webhook(job, "failed", {}, error_message=str(exc))
         await _best_effort_signal(streaming_service.signal_run_error, run_id, safe_message, type(exc).__name__)
     else:
@@ -105,6 +120,47 @@ async def execute_run(job: RunJob) -> None:
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
+
+
+def _emit_run_started_metric(job: RunJob) -> None:
+    """Emit a count when a worker or local executor starts processing a run."""
+    emit_metric("RunsStarted", 1, properties=_run_metric_properties(job))
+
+
+def _emit_run_terminal_metrics(
+    job: RunJob,
+    status: str,
+    started_at: float,
+    *,
+    terminal_reason: str | None = None,
+    error_class: str | None = None,
+) -> None:
+    """Emit terminal count and duration metrics after DB status is committed."""
+    properties = _run_metric_properties(job)
+    properties["terminal_status"] = status
+    if terminal_reason is not None:
+        properties["terminal_reason"] = terminal_reason
+    if error_class is not None:
+        properties["error_class"] = error_class
+
+    emit_metric("RunsTerminal", 1, dimensions={"Status": status}, properties=properties)
+    emit_metric(
+        "RunDurationMs",
+        max(0.0, (perf_counter() - started_at) * 1000),
+        unit="Milliseconds",
+        dimensions={"Status": status},
+        properties=properties,
+    )
+
+
+def _run_metric_properties(job: RunJob) -> dict[str, Any]:
+    """Return high-cardinality run context as log properties, not dimensions."""
+    return {
+        "run_id": job.identity.run_id,
+        "thread_id": job.identity.thread_id,
+        "user_id": job.user.identity,
+        "graph_id": job.identity.graph_id,
+    }
 
 
 async def _best_effort_signal(fn: Any, *args: Any) -> None:
