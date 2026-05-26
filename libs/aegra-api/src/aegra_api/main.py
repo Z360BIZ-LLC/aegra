@@ -1,5 +1,7 @@
 """FastAPI application for Aegra (Agent Protocol Server)"""
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -28,6 +30,7 @@ from aegra_api.core.route_merger import (
     merge_exception_handlers,
     merge_lifespans,
 )
+from aegra_api.core.sidecar_health import LoopHeartbeat, heartbeat_task, start_sidecar
 from aegra_api.middleware import ContentTypeFixMiddleware, StructLogMiddleware
 from aegra_api.models.errors import AgentProtocolError, get_error_type
 from aegra_api.observability.metrics import setup_prometheus_metrics
@@ -71,9 +74,43 @@ def _log_connection_help(error: Exception) -> None:
     )
 
 
+def _augment_loop_exception_handler(loop: asyncio.AbstractEventLoop) -> None:
+    """Route unhandled asyncio task exceptions through structlog.
+
+    Wraps any existing handler so we don't blow away custom integrations
+    (e.g., from observability setup). Silent task failures previously
+    only showed up via the default warning to stderr — easy to miss in
+    CloudWatch JSON logs.
+    """
+    previous_handler = loop.get_exception_handler()
+
+    def handler(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        exc = context.get("exception")
+        logger.error(
+            "asyncio.unhandled_task_exception",
+            message=context.get("message"),
+            future=str(context.get("future")) if context.get("future") else None,
+            task=str(context.get("task")) if context.get("task") else None,
+            exc_info=exc if isinstance(exc, BaseException) else None,
+        )
+        if previous_handler is not None:
+            previous_handler(_loop, context)
+
+    loop.set_exception_handler(handler)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan context manager for startup/shutdown"""
+    # MUST be first — see docs/aegra-capacity-analysis.md §11 and the sidecar
+    # adjustment plan. Lifespan blocks uvicorn from binding port 8000 until we
+    # ``yield``, so if migrations take 30s the ALB hammers /live during that
+    # window. The sidecar binds port 8001 synchronously on a daemon thread,
+    # independent of the asyncio loop, so health probes succeed immediately.
+    hb = LoopHeartbeat()
+    sidecar_thread = start_sidecar(hb)
+    logger.info("Sidecar /live listening on port 8001", thread=sidecar_thread.name)
+
     # Auto-apply pending database migrations before anything else
     try:
         await run_migrations_async()
@@ -125,7 +162,20 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if settings.redis.REDIS_BROKER_ENABLED:
         await lease_reaper.start()
 
+    # Schedule the heartbeat task last, after all init is complete. The
+    # sidecar has been answering with a fresh (just-initialized) heartbeat
+    # the entire time; from here on, real loop ticks keep it fresh.
+    _augment_loop_exception_handler(asyncio.get_running_loop())
+    heartbeat_task_handle = asyncio.create_task(heartbeat_task(hb), name="loop_heartbeat")
+
     yield
+
+    # Stop the heartbeat first so lag starts growing only if the loop is
+    # genuinely stuck during shutdown. The sidecar thread is a daemon and
+    # dies with the process — no explicit shutdown required.
+    heartbeat_task_handle.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await heartbeat_task_handle
 
     # Shutdown order: reaper → executor (drains jobs) → broker → Redis → DB
     if settings.redis.REDIS_BROKER_ENABLED:

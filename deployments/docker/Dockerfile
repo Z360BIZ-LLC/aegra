@@ -69,7 +69,7 @@ COPY agents/text/src/ ./src/
 # Create writable cache directories for non-root user
 RUN mkdir -p /tmp/composio-cache && chown -R app:app /tmp/composio-cache
 
-EXPOSE 8000
+EXPOSE 8000 8001
 
 # Run as non-root
 USER app
