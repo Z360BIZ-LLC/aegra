@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.9.17"
+version = "0.9.18"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -51,6 +51,9 @@ dependencies = [
 
     # Redis (optional broker backend for multi-instance streaming)
     "redis[hiredis]>=5.0.0",
+
+    # Cron expression parsing
+    "croniter>=6.0.0",
 ]
 
 [project.urls]
