@@ -486,6 +486,116 @@ class TestSearchAssistants:
         assert data[0]["graph_id"] == "prod-graph"
 
 
+class TestSearchAssistantsSortAndAuth:
+    """Sort params + #333 regression: auth handlers returning filters must not 500."""
+
+    def test_search_with_sort_by_name_asc(self, client, mock_assistant_service):
+        mock_assistant_service.search_assistants.return_value = []
+
+        resp = client.post(
+            "/assistants/search",
+            json={"sort_by": "name", "sort_order": "asc"},
+        )
+
+        assert resp.status_code == 200
+        kwargs = mock_assistant_service.search_assistants.call_args.kwargs
+        assert kwargs.get("sort_asc") is True
+        sort_column = kwargs.get("sort_column")
+        assert getattr(sort_column, "key", None) == "name"
+
+    def test_search_with_sort_by_only_defaults_to_desc(self, client, mock_assistant_service):
+        mock_assistant_service.search_assistants.return_value = []
+
+        resp = client.post("/assistants/search", json={"sort_by": "updated_at"})
+
+        assert resp.status_code == 200
+        kwargs = mock_assistant_service.search_assistants.call_args.kwargs
+        assert kwargs.get("sort_asc") is False
+
+    def test_invalid_sort_by_returns_422(self, client, mock_assistant_service):
+        resp = client.post("/assistants/search", json={"sort_by": "; DROP TABLE"})
+        assert resp.status_code == 422
+
+    def test_invalid_sort_order_returns_422(self, client, mock_assistant_service):
+        resp = client.post("/assistants/search", json={"sort_by": "name", "sort_order": "sideways"})
+        assert resp.status_code == 422
+
+    def test_search_succeeds_when_auth_handler_returns_filters(self, mock_assistant_service):
+        """Regression for #333: auth handler returning a flat filter dict must not 500."""
+        from aegra_api.api import assistants as assistants_module
+        from aegra_api.services.assistant_service import get_assistant_service
+
+        app = create_test_app(include_runs=False, include_threads=False)
+        app.include_router(assistants_module.router)
+        app.dependency_overrides[get_assistant_service] = lambda: mock_assistant_service
+        mock_assistant_service.search_assistants.return_value = []
+
+        with patch("aegra_api.api.assistants.handle_event", new_callable=AsyncMock) as mock_handle:
+            mock_handle.return_value = {"owner": "user-123"}
+            resp = make_client(app).post("/assistants/search", json={"metadata": {"env": "prod"}})
+
+        assert resp.status_code == 200
+        called_request = mock_assistant_service.search_assistants.call_args.args[0]
+        assert called_request.metadata == {"env": "prod", "owner": "user-123"}
+
+    def test_count_succeeds_when_auth_handler_returns_filters(self, mock_assistant_service):
+        """Regression for #333: same bug existed on /assistants/count."""
+        from aegra_api.api import assistants as assistants_module
+        from aegra_api.services.assistant_service import get_assistant_service
+
+        app = create_test_app(include_runs=False, include_threads=False)
+        app.include_router(assistants_module.router)
+        app.dependency_overrides[get_assistant_service] = lambda: mock_assistant_service
+        mock_assistant_service.count_assistants.return_value = 7
+
+        with patch("aegra_api.api.assistants.handle_event", new_callable=AsyncMock) as mock_handle:
+            mock_handle.return_value = {"owner": "user-123"}
+            resp = make_client(app).post("/assistants/count", json={})
+
+        assert resp.status_code == 200
+        assert resp.json() == 7
+        called_request = mock_assistant_service.count_assistants.call_args.args[0]
+        assert called_request.metadata == {"owner": "user-123"}
+
+    def test_list_succeeds_when_auth_handler_returns_filters(self, mock_assistant_service):
+        """Regression for #333: GET /assistants used a non-existent kwarg, so auth filters were silently dropped."""
+        from aegra_api.api import assistants as assistants_module
+        from aegra_api.services.assistant_service import get_assistant_service
+
+        app = create_test_app(include_runs=False, include_threads=False)
+        app.include_router(assistants_module.router)
+        app.dependency_overrides[get_assistant_service] = lambda: mock_assistant_service
+        mock_assistant_service.list_assistants.return_value = []
+
+        with patch("aegra_api.api.assistants.handle_event", new_callable=AsyncMock) as mock_handle:
+            mock_handle.return_value = {"owner": "user-123"}
+            resp = make_client(app).get("/assistants")
+
+        assert resp.status_code == 200
+        mock_assistant_service.list_assistants.assert_called_once()
+        kwargs = mock_assistant_service.list_assistants.call_args.kwargs
+        assert kwargs.get("metadata") == {"owner": "user-123"}
+
+    def test_list_with_filters_does_not_paginate(self, mock_assistant_service):
+        """GET /assistants must return all rows even when an auth handler is
+        active — going through search_assistants would silently cap at 20."""
+        from aegra_api.api import assistants as assistants_module
+        from aegra_api.services.assistant_service import get_assistant_service
+
+        app = create_test_app(include_runs=False, include_threads=False)
+        app.include_router(assistants_module.router)
+        app.dependency_overrides[get_assistant_service] = lambda: mock_assistant_service
+        mock_assistant_service.list_assistants.return_value = []
+
+        with patch("aegra_api.api.assistants.handle_event", new_callable=AsyncMock) as mock_handle:
+            mock_handle.return_value = {"owner": "user-123"}
+            resp = make_client(app).get("/assistants")
+
+        assert resp.status_code == 200
+        mock_assistant_service.search_assistants.assert_not_called()
+        mock_assistant_service.list_assistants.assert_called_once()
+
+
 class TestCountAssistants:
     """Test POST /assistants/count"""
 
@@ -739,3 +849,94 @@ class TestGetAssistantSubgraphs:
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, dict)
+
+
+class TestAssistantExtrasAuthHandlerDispatch:
+    """Pin auth handler dispatch on latest/versions/schemas/graph/subgraphs.
+
+    These endpoints previously skipped ``handle_event`` entirely — any handler
+    restricting assistant visibility (tenant scoping, role gates) was silently
+    bypassed. Each case verifies the handler is invoked and that its rejection
+    propagates as 403 instead of the request reaching the service layer.
+    """
+
+    @pytest.fixture
+    def app(self, mock_assistant_service):
+        app = create_test_app(include_runs=False, include_threads=False)
+        from aegra_api.api import assistants as assistants_module
+
+        app.include_router(assistants_module.router)
+        app.dependency_overrides[get_assistant_service] = lambda: mock_assistant_service
+        return app
+
+    @staticmethod
+    def _patched_handler(allow: bool = True):
+        """Patch ``handle_event`` to allow (None) or reject (403)."""
+        from fastapi import HTTPException
+
+        mock = AsyncMock()
+        if allow:
+            mock.return_value = None
+        else:
+            mock.side_effect = HTTPException(status_code=403, detail="forbidden")
+        return patch("aegra_api.api.assistants.handle_event", mock)
+
+    def test_set_latest_invokes_update_handler(self, app, mock_assistant_service):
+        mock_assistant_service.set_assistant_latest.return_value = make_assistant()
+        with self._patched_handler() as mock_handle:
+            resp = make_client(app).post("/assistants/asst-1/latest", json={"version": 3})
+        assert resp.status_code == 200
+        ctx, value = mock_handle.call_args.args
+        assert (ctx.resource, ctx.action) == ("assistants", "update")
+        assert value == {"assistant_id": "asst-1", "version": 3}
+
+    def test_set_latest_rejection_returns_403(self, app, mock_assistant_service):
+        with self._patched_handler(allow=False):
+            resp = make_client(app).post("/assistants/asst-1/latest", json={"version": 3})
+        assert resp.status_code == 403
+        mock_assistant_service.set_assistant_latest.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("method", "path", "service_attr", "return_value"),
+        [
+            ("post", "/assistants/asst-1/versions", "list_assistant_versions", []),
+            (
+                "get",
+                "/assistants/asst-1/schemas",
+                "get_assistant_schemas",
+                {
+                    "input_schema": {},
+                    "output_schema": {},
+                    "state_schema": {},
+                    "config_schema": {},
+                },
+            ),
+            ("get", "/assistants/asst-1/graph", "get_assistant_graph", {"nodes": [], "edges": []}),
+            ("get", "/assistants/asst-1/subgraphs", "get_assistant_subgraphs", {}),
+        ],
+    )
+    def test_read_endpoints_invoke_read_handler(
+        self, app, mock_assistant_service, method, path, service_attr, return_value
+    ):
+        getattr(mock_assistant_service, service_attr).return_value = return_value
+        with self._patched_handler() as mock_handle:
+            resp = getattr(make_client(app), method)(path)
+        assert resp.status_code == 200
+        ctx, value = mock_handle.call_args.args
+        assert (ctx.resource, ctx.action) == ("assistants", "read")
+        assert value == {"assistant_id": "asst-1"}
+
+    @pytest.mark.parametrize(
+        ("method", "path", "service_attr"),
+        [
+            ("post", "/assistants/asst-1/versions", "list_assistant_versions"),
+            ("get", "/assistants/asst-1/schemas", "get_assistant_schemas"),
+            ("get", "/assistants/asst-1/graph", "get_assistant_graph"),
+            ("get", "/assistants/asst-1/subgraphs", "get_assistant_subgraphs"),
+        ],
+    )
+    def test_read_endpoints_reject_propagates_403(self, app, mock_assistant_service, method, path, service_attr):
+        with self._patched_handler(allow=False):
+            resp = getattr(make_client(app), method)(path)
+        assert resp.status_code == 403
+        getattr(mock_assistant_service, service_attr).assert_not_called()

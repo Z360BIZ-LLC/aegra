@@ -121,6 +121,13 @@ def _extract_graph_schemas(graph) -> dict:
     }
 
 
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards (``%``, ``_``, ``\\``) in user input.
+    Backslash is replaced first so subsequent escapes are not double-escaped.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class AssistantService:
     """Service for managing assistants"""
 
@@ -219,29 +226,40 @@ class AssistantService:
 
         return to_pydantic(assistant_orm)
 
-    async def list_assistants(self, user_identity: str) -> list[Assistant]:
-        """List user's assistants and system assistants"""
-        # Include both user's assistants and system assistants (like search_assistants does)
+    async def list_assistants(
+        self,
+        user_identity: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[Assistant]:
+        """List user's assistants and system assistants.
+
+        Optionally filtered by a metadata containment predicate. Unlike
+        ``search_assistants``, this method does not paginate — callers that
+        need pagination should use search.
+        """
         stmt = select(AssistantORM).where(or_(AssistantORM.user_id == user_identity, AssistantORM.user_id == "system"))
+        if metadata:
+            stmt = stmt.where(AssistantORM.metadata_dict.op("@>")(metadata))
         result = await self.session.scalars(stmt)
-        user_assistants = [to_pydantic(a) for a in result.all()]
-        return user_assistants
+        return [to_pydantic(a) for a in result.all()]
 
     async def search_assistants(
         self,
         request: Any,  # AssistantSearchRequest
         user_identity: str,
+        *,
+        sort_column: Any | None = None,
+        sort_asc: bool = False,
     ) -> list[Assistant]:
         """Search assistants with filters"""
-        # Start with user's assistants
         stmt = select(AssistantORM).where(or_(AssistantORM.user_id == user_identity, AssistantORM.user_id == "system"))
 
-        # Apply filters
         if request.name:
-            stmt = stmt.where(AssistantORM.name.ilike(f"%{request.name}%"))
+            stmt = stmt.where(AssistantORM.name.ilike(f"%{_escape_like(request.name)}%", escape="\\"))
 
         if request.description:
-            stmt = stmt.where(AssistantORM.description.ilike(f"%{request.description}%"))
+            stmt = stmt.where(AssistantORM.description.ilike(f"%{_escape_like(request.description)}%", escape="\\"))
 
         if request.graph_id:
             stmt = stmt.where(AssistantORM.graph_id == request.graph_id)
@@ -249,15 +267,18 @@ class AssistantService:
         if request.metadata:
             stmt = stmt.where(AssistantORM.metadata_dict.op("@>")(request.metadata))
 
-        # Apply pagination
+        column = sort_column if sort_column is not None else AssistantORM.created_at
+        direction = column.asc() if sort_asc else column.desc()
+        # Tie-break on assistant_id keeps offset pagination stable when the
+        # primary sort column has duplicates.
+        stmt = stmt.order_by(direction, AssistantORM.assistant_id.asc())
+
         offset = request.offset or 0
         limit = request.limit or 20
         stmt = stmt.offset(offset).limit(limit)
 
         result = await self.session.scalars(stmt)
-        paginated_assistants = [to_pydantic(a) for a in result.all()]
-
-        return paginated_assistants
+        return [to_pydantic(a) for a in result.all()]
 
     async def count_assistants(
         self,
@@ -269,10 +290,10 @@ class AssistantService:
         stmt = select(func.count()).where(or_(AssistantORM.user_id == user_identity, AssistantORM.user_id == "system"))
 
         if request.name:
-            stmt = stmt.where(AssistantORM.name.ilike(f"%{request.name}%"))
+            stmt = stmt.where(AssistantORM.name.ilike(f"%{_escape_like(request.name)}%", escape="\\"))
 
         if request.description:
-            stmt = stmt.where(AssistantORM.description.ilike(f"%{request.description}%"))
+            stmt = stmt.where(AssistantORM.description.ilike(f"%{_escape_like(request.description)}%", escape="\\"))
 
         if request.graph_id:
             stmt = stmt.where(AssistantORM.graph_id == request.graph_id)
