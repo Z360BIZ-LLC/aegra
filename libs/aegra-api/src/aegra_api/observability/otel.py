@@ -133,9 +133,7 @@ class OpenTelemetryProvider(ObservabilityProvider):
 
         # 3. Console Exporter
         if settings.observability.OTEL_CONSOLE_EXPORT:
-            self._tracer_provider.add_span_processor(
-                self._build_batch_span_processor(ConsoleSpanExporter())
-            )
+            self._tracer_provider.add_span_processor(self._build_batch_span_processor(ConsoleSpanExporter()))
             processors_count += 1
             logger.info("Observability: Console export enabled")
 

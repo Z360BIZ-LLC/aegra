@@ -42,12 +42,10 @@ depends_on = None
 def upgrade() -> None:
     with op.get_context().autocommit_block():
         op.execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thread_user_created_at "
-            "ON thread (user_id, created_at DESC)"
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thread_user_created_at ON thread (user_id, created_at DESC)"
         )
         op.execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thread_user_updated_at "
-            "ON thread (user_id, updated_at DESC)"
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thread_user_updated_at ON thread (user_id, updated_at DESC)"
         )
 
 

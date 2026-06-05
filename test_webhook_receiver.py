@@ -27,13 +27,12 @@ async def receive_webhook(request: Request):
 
     # Save to file with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = payload.get('run_id', 'unknown')[:8]  # First 8 chars of run_id
+    run_id = payload.get("run_id", "unknown")[:8]  # First 8 chars of run_id
     filename = f"webhook_{timestamp}_{run_id}.json"
     filepath = WEBHOOK_DIR / filename
 
-    with open(filepath, 'w') as f:
+    with open(filepath, "w") as f:
         json.dump(payload, f, indent=2)
-
 
     print("\n" + "=" * 60)
     print("WEBHOOK RECEIVED!")
@@ -43,7 +42,6 @@ async def receive_webhook(request: Request):
     print(f"Status: {payload.get('status')}")
     print(f"Timestamp: {payload.get('webhook_sent_at')}")
     print(f"Saved to: {filepath}")
-
 
     if "error" in payload:
         print(f"\nError: {payload.get('error')}")

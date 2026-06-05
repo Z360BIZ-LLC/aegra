@@ -119,9 +119,7 @@ class TestDatabaseManager:
         assert db_manager.engine == mock_db_deps["engine_instance"]
         assert db_manager.lg_pool == mock_db_deps["pool_instance"]
 
-    async def test_initialize_passes_statement_timeout_to_connect_args(
-        self, db_manager, mock_db_deps
-    ):
+    async def test_initialize_passes_statement_timeout_to_connect_args(self, db_manager, mock_db_deps):
         """STATEMENT_TIMEOUT_S > 0 → connect_args carries command_timeout and statement_timeout."""
         with patch.object(settings.pool, "STATEMENT_TIMEOUT_S", 30):
             await db_manager.initialize()
@@ -133,9 +131,7 @@ class TestDatabaseManager:
         # PgBouncer compat flag must still be set.
         assert connect_args["prepared_statement_cache_size"] == 0
 
-    async def test_initialize_omits_statement_timeout_when_disabled(
-        self, db_manager, mock_db_deps
-    ):
+    async def test_initialize_omits_statement_timeout_when_disabled(self, db_manager, mock_db_deps):
         """STATEMENT_TIMEOUT_S = 0 → no command_timeout, no statement_timeout server setting."""
         with patch.object(settings.pool, "STATEMENT_TIMEOUT_S", 0):
             await db_manager.initialize()
