@@ -1,6 +1,6 @@
 """Unit tests for the OpenTelemetry provider."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -197,7 +197,14 @@ class TestOpenTelemetryProviderSetup:
         provider.setup()
 
         mock_target.get_exporter.assert_called_once()
-        mock_deps["bsp"].assert_any_call(mock_exporter)
+        # _build_batch_span_processor wraps every exporter with bounded BSP kwargs.
+        mock_deps["bsp"].assert_any_call(
+            mock_exporter,
+            max_queue_size=ANY,
+            schedule_delay_millis=ANY,
+            max_export_batch_size=ANY,
+            export_timeout_millis=ANY,
+        )
         tracer_provider_instance = mock_deps["tp"].return_value
         tracer_provider_instance.add_span_processor.assert_called()
 
@@ -227,9 +234,15 @@ class TestOpenTelemetryProviderSetup:
             # Should log error for bad target
             mock_logger.error.assert_called()
 
-            # Should still add processor for good target
+            # Should still add processor for good target (wrapped by bounded BSP).
             tracer_provider_instance = mock_deps["tp"].return_value
-            mock_deps["bsp"].assert_called_with(good_exporter)
+            mock_deps["bsp"].assert_called_with(
+                good_exporter,
+                max_queue_size=ANY,
+                schedule_delay_millis=ANY,
+                max_export_batch_size=ANY,
+                export_timeout_millis=ANY,
+            )
             # SpanEnrichmentProcessor is added unconditionally + one BatchSpanProcessor
             # for the good target → two calls total
             assert tracer_provider_instance.add_span_processor.call_count == 2
