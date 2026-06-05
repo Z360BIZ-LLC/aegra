@@ -1,7 +1,7 @@
 """Assistant-related Pydantic models for Agent Protocol"""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,10 +15,12 @@ class AssistantCreate(BaseModel):
         description="Human-readable assistant name (auto-generated if not provided)",
     )
     description: str | None = Field(None, description="Assistant description")
-    config: dict[str, Any] | None = Field({}, description="Assistant configuration")
-    context: dict[str, Any] | None = Field({}, description="Assistant context")
+    config: dict[str, Any] | None = Field(default_factory=dict, description="Assistant configuration")
+    context: dict[str, Any] | None = Field(default_factory=dict, description="Assistant context")
     graph_id: str = Field(..., description="LangGraph graph ID from aegra.json")
-    metadata: dict[str, Any] | None = Field({}, description="Metadata to use for searching and filtering assistants.")
+    metadata: dict[str, Any] | None = Field(
+        default_factory=dict, description="Metadata to use for searching and filtering assistants."
+    )
     if_exists: str | None = Field("error", description="What to do if assistant exists: error or do_nothing")
 
 
@@ -49,13 +51,15 @@ class AssistantUpdate(BaseModel):
 
     name: str | None = Field(None, description="The name of the assistant (auto-generated if not provided)")
     description: str | None = Field(None, description="The description of the assistant. Defaults to null.")
-    config: dict[str, Any] | None = Field({}, description="Configuration to use for the graph.")
+    config: dict[str, Any] | None = Field(default_factory=dict, description="Configuration to use for the graph.")
     graph_id: str = Field("agent", description="The ID of the graph")
     context: dict[str, Any] | None = Field(
-        {},
+        default_factory=dict,
         description="The context to use for the graph. Useful when graph is configurable.",
     )
-    metadata: dict[str, Any] | None = Field({}, description="Metadata to use for searching and filtering assistants.")
+    metadata: dict[str, Any] | None = Field(
+        default_factory=dict, description="Metadata to use for searching and filtering assistants."
+    )
 
 
 class AssistantList(BaseModel):
@@ -73,7 +77,18 @@ class AssistantSearchRequest(BaseModel):
     graph_id: str | None = Field(None, description="Filter by graph ID")
     limit: int | None = Field(20, le=100, ge=1, description="Maximum results")
     offset: int | None = Field(0, ge=0, description="Results offset")
-    metadata: dict[str, Any] | None = Field({}, description="Metadata to use for searching and filtering assistants.")
+    metadata: dict[str, Any] | None = Field(
+        default_factory=dict,
+        description="Metadata to use for searching and filtering assistants.",
+    )
+    sort_by: Literal["assistant_id", "name", "graph_id", "created_at", "updated_at"] | None = Field(
+        None,
+        description="Field to sort by (SDK-compatible).",
+    )
+    sort_order: Literal["asc", "desc"] | None = Field(
+        None,
+        description="Sort direction (SDK-compatible). Defaults to 'desc' when sort_by is set.",
+    )
 
 
 class AgentSchemas(BaseModel):

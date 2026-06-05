@@ -15,6 +15,7 @@ from fastapi.routing import APIRoute, APIRouter
 
 from aegra_api import __version__
 from aegra_api.api.assistants import router as assistants_router
+from aegra_api.api.crons import router as crons_router
 from aegra_api.api.runs import router as runs_router
 from aegra_api.api.stateless_runs import router as stateless_runs_router
 from aegra_api.api.store import router as store_router
@@ -36,6 +37,7 @@ from aegra_api.models.errors import AgentProtocolError, get_error_type
 from aegra_api.observability.metrics import setup_prometheus_metrics
 from aegra_api.observability.setup import setup_observability
 from aegra_api.services.broker import broker_manager
+from aegra_api.services.cron_scheduler import cron_scheduler
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
@@ -47,6 +49,7 @@ OPENAPI_TAGS: list[dict[str, Any]] = [
     {"name": "Threads", "description": "Accumulated state and outputs from a group of runs."},
     {"name": "Thread Runs", "description": "Invoke a graph on a thread, updating its persistent state."},
     {"name": "Stateless Runs", "description": "Invoke a graph without state or memory persistence."},
+    {"name": "Crons", "description": "Scheduled recurring runs on a cron schedule."},
     {"name": "Store", "description": "Persistent key-value and semantic storage available from any thread."},
     {"name": "Health", "description": "Server health checks and service information."},
 ]
@@ -102,21 +105,23 @@ def _augment_loop_exception_handler(loop: asyncio.AbstractEventLoop) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan context manager for startup/shutdown"""
-    # MUST be first — see docs/aegra-capacity-analysis.md §11 and the sidecar
-    # adjustment plan. Lifespan blocks uvicorn from binding port 8000 until we
-    # ``yield``, so if migrations take 30s the ALB hammers /live during that
-    # window. The sidecar binds port 8001 synchronously on a daemon thread,
-    # independent of the asyncio loop, so health probes succeed immediately.
+    # Sidecar MUST be first — lifespan blocks uvicorn from binding port 8000
+    # until we yield, so without it the ALB hammers /live during 30s migrations.
+    # The sidecar binds port 8001 on a daemon thread, independent of the loop.
     hb = LoopHeartbeat()
     sidecar_thread = start_sidecar(hb)
     logger.info("Sidecar /live listening on port 8001", thread=sidecar_thread.name)
 
-    # Auto-apply pending database migrations before anything else
-    try:
-        await run_migrations_async()
-    except (ConnectionRefusedError, OSError) as e:
-        _log_connection_help(e)
-        raise
+    # Multi-pod K8s: set RUN_MIGRATIONS_ON_STARTUP=false + run `aegra db upgrade`
+    # out-of-band. See docs/guides/deployment.mdx.
+    if settings.app.RUN_MIGRATIONS_ON_STARTUP:
+        try:
+            await run_migrations_async()
+        except (ConnectionRefusedError, OSError) as e:
+            _log_connection_help(e)
+            raise
+    else:
+        logger.info("skipping startup migrations (RUN_MIGRATIONS_ON_STARTUP=false)")
 
     # Startup: Initialize database and LangGraph components
     try:
@@ -162,22 +167,27 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if settings.redis.REDIS_BROKER_ENABLED:
         await lease_reaper.start()
 
-    # Schedule the heartbeat task last, after all init is complete. The
-    # sidecar has been answering with a fresh (just-initialized) heartbeat
-    # the entire time; from here on, real loop ticks keep it fresh.
+    # Start cron scheduler (fires due cron jobs)
+    if settings.cron.CRON_ENABLED:
+        await cron_scheduler.start()
+
+    # Schedule the heartbeat task last, after all init is complete. The sidecar
+    # has been answering with a fresh (just-initialized) heartbeat the entire
+    # time; from here on, real loop ticks keep it fresh.
     _augment_loop_exception_handler(asyncio.get_running_loop())
     heartbeat_task_handle = asyncio.create_task(heartbeat_task(hb), name="loop_heartbeat")
 
     yield
 
-    # Stop the heartbeat first so lag starts growing only if the loop is
-    # genuinely stuck during shutdown. The sidecar thread is a daemon and
-    # dies with the process — no explicit shutdown required.
+    # Stop the heartbeat first so lag only grows if the loop is genuinely stuck
+    # during shutdown. The sidecar thread is a daemon and dies with the process.
     heartbeat_task_handle.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await heartbeat_task_handle
 
-    # Shutdown order: reaper → executor (drains jobs) → broker → Redis → DB
+    # Shutdown order: cron → reaper → executor (drains jobs) → broker → Redis → DB
+    if settings.cron.CRON_ENABLED:
+        await cron_scheduler.stop()
     if settings.redis.REDIS_BROKER_ENABLED:
         await lease_reaper.stop()
     await executor.stop()
@@ -332,7 +342,8 @@ def _include_core_routers(app: FastAPI) -> None:
     3. Threads (with auth)
     4. Runs (with auth)
     5. Stateless Runs (with auth)
-    6. Store (with auth)
+    6. Crons (with auth)
+    7. Store (with auth)
 
     Args:
         app: FastAPI application instance
@@ -342,6 +353,7 @@ def _include_core_routers(app: FastAPI) -> None:
     app.include_router(threads_router)
     app.include_router(runs_router)
     app.include_router(stateless_runs_router)
+    app.include_router(crons_router)
     app.include_router(store_router)
 
 
