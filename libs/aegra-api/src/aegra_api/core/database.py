@@ -1,5 +1,7 @@
 """Database manager with LangGraph integration"""
 
+from typing import Any
+
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
@@ -34,13 +36,24 @@ class DatabaseManager:
         # 1. SQLAlchemy Engine (app metadata, uses asyncpg)
         # We strictly limit this pool because the main load
         # is handled by LangGraph components.
+        connect_args: dict[str, Any] = {
+            "prepared_statement_cache_size": 0,  # PgBouncer compatibility
+        }
+        # Bound every metadata query so a stuck statement can't hold a pool
+        # slot indefinitely. Belt-and-braces: asyncpg cancels the protocol via
+        # command_timeout; statement_timeout makes the server itself give up.
+        if settings.pool.STATEMENT_TIMEOUT_S > 0:
+            connect_args["command_timeout"] = settings.pool.STATEMENT_TIMEOUT_S
+            connect_args["server_settings"] = {
+                "statement_timeout": str(settings.pool.STATEMENT_TIMEOUT_S * 1000),
+            }
         self.engine = create_async_engine(
             self._database_url,
             pool_size=settings.pool.SQLALCHEMY_POOL_SIZE,
             max_overflow=settings.pool.SQLALCHEMY_MAX_OVERFLOW,
             pool_pre_ping=True,
             echo=settings.db.DB_ECHO_LOG,
-            connect_args={"prepared_statement_cache_size": 0},  # PgBouncer compatibility
+            connect_args=connect_args,
         )
 
         lg_max = settings.pool.LANGGRAPH_MAX_POOL_SIZE

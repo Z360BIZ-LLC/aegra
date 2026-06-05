@@ -25,6 +25,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Text,
+    desc,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -147,8 +148,15 @@ class Thread(Base):
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
-    # Indexes for performance
-    __table_args__ = (Index("idx_thread_user", "user_id"),)
+    # Indexes for performance. Composite (user_id, <sort> DESC) indexes back
+    # POST /threads/search default-sort and frontend updated_at sort paths
+    # without a separate in-memory sort step. GIN index on metadata_json is
+    # managed by alembic only (see idx_thread_metadata_gin).
+    __table_args__ = (
+        Index("idx_thread_user", "user_id"),
+        Index("idx_thread_user_created_at", "user_id", desc("created_at")),
+        Index("idx_thread_user_updated_at", "user_id", desc("updated_at")),
+    )
 
 
 class Run(Base):

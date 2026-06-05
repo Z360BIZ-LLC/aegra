@@ -300,6 +300,12 @@ class PoolSettings(EnvBase):
     LANGGRAPH_MIN_POOL_SIZE: int = 5
     LANGGRAPH_MAX_POOL_SIZE: int = 20
 
+    # Caps any single SQLAlchemy/asyncpg query. Set on the SQLAlchemy engine
+    # only — the LangGraph psycopg pool is intentionally left uncapped because
+    # checkpoint writes for large state have a legitimate long tail. Zero
+    # disables both the asyncpg command_timeout and Postgres statement_timeout.
+    STATEMENT_TIMEOUT_S: int = 30
+
 
 class ObservabilitySettings(EnvBase):
     """
