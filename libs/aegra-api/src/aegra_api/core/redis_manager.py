@@ -26,10 +26,14 @@ class RedisManager:
         if self._client is not None:
             return
 
+        # health_check_interval keeps pooled connections alive across long BLPOP
+        # idles so the next blocking call doesn't raise on a half-closed socket.
         self._pool = aioredis.ConnectionPool.from_url(
             settings.redis.REDIS_URL,
             max_connections=settings.redis.REDIS_MAX_CONNECTIONS,
             decode_responses=True,
+            socket_keepalive=True,
+            health_check_interval=30,
         )
         self._client = aioredis.Redis(connection_pool=self._pool)
 
