@@ -35,6 +35,30 @@ class TestRedisManager:
         manager._pool = None
 
     @pytest.mark.asyncio
+    async def test_initialize_enables_keepalive_and_health_check(self) -> None:
+        """Pool is created with TCP keepalive + periodic health check so BLPOP
+        does not raise on a connection silently dropped by an idle NAT/LB."""
+        manager = RedisManager()
+
+        mock_client = AsyncMock()
+        mock_pool = AsyncMock()
+
+        with (
+            patch("aegra_api.core.redis_manager.aioredis.ConnectionPool") as mock_pool_cls,
+            patch("aegra_api.core.redis_manager.aioredis.Redis", return_value=mock_client),
+        ):
+            mock_pool_cls.from_url.return_value = mock_pool
+
+            await manager.initialize()
+
+            kwargs = mock_pool_cls.from_url.call_args.kwargs
+            assert kwargs["socket_keepalive"] is True
+            assert kwargs["health_check_interval"] == 30
+
+        manager._client = None
+        manager._pool = None
+
+    @pytest.mark.asyncio
     async def test_initialize_is_idempotent(self) -> None:
         """Test that calling initialize twice doesn't create a second pool"""
         manager = RedisManager()
