@@ -738,6 +738,8 @@ def create_run_config(
 
     # Add metadata from all observability providers (independent of callbacks)
     cfg.setdefault("metadata", {})
+    cfg["metadata"].setdefault("run_id", run_id)
+    cfg["metadata"].setdefault("thread_id", thread_id)
     user_identity = user.identity if user else None
     observability_metadata = get_tracing_metadata(run_id, thread_id, user_identity)
     cfg["metadata"].update(observability_metadata)
