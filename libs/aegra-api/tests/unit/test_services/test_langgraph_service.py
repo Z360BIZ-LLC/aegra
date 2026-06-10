@@ -644,6 +644,8 @@ class TestLangGraphServiceConfigs:
         assert result["configurable"]["thread_id"] == thread_id
         assert result["configurable"]["user_id"] == "user-123"
         assert result["custom"] == "value"
+        assert result["metadata"]["run_id"] == run_id
+        assert result["metadata"]["thread_id"] == thread_id
 
     def test_create_run_config_with_checkpoint(self):
         """Test creating run config with checkpoint"""
@@ -783,6 +785,7 @@ class TestLangGraphServiceConfigs:
 
         assert result["run_id"] == run_id
         assert result["configurable"]["run_id"] == run_id
+        assert result["metadata"]["run_id"] == run_id
 
 
 @pytest.mark.asyncio
