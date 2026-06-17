@@ -109,6 +109,36 @@ class TestLangGraphAuthBackend:
             backend = LangGraphAuthBackend()
             assert backend.auth_instance is None
 
+    def test_no_auth_warning_emitted_once_at_init(self, monkeypatch: pytest.MonkeyPatch):
+        """The no-auth warning fires once at startup, not on every request."""
+        from aegra_api.core import auth_middleware
+
+        warnings: list[str] = []
+        monkeypatch.setattr(auth_middleware.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+
+        with patch.object(LangGraphAuthBackend, "_load_auth_instance", return_value=None):
+            LangGraphAuthBackend()
+
+        assert sum("single 'anonymous' identity" in w for w in warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_authenticate_does_not_warn_per_request(self, monkeypatch: pytest.MonkeyPatch):
+        """authenticate() must not emit the no-auth warning; that would flood logs."""
+        from aegra_api.core import auth_middleware
+
+        with patch.object(LangGraphAuthBackend, "_load_auth_instance", return_value=None):
+            backend = LangGraphAuthBackend()
+
+        warnings: list[str] = []
+        monkeypatch.setattr(auth_middleware.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+
+        mock_conn = Mock(spec=HTTPConnection)
+        mock_conn.headers = {}
+        for _ in range(3):
+            await backend.authenticate(mock_conn)
+
+        assert not any("single 'anonymous' identity" in w for w in warnings)
+
     def test_load_auth_instance_success(self):
         """Test successful auth instance loading"""
         mock_auth_instance = Mock()
