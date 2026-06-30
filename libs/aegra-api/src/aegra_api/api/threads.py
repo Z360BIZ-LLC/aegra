@@ -35,6 +35,7 @@ from aegra_api.models import (
 )
 from aegra_api.models.errors import CONFLICT, NOT_FOUND
 from aegra_api.services.streaming_service import streaming_service
+from aegra_api.services.thread_search_projection import thread_search_projection
 from aegra_api.services.thread_state_service import ThreadStateService
 
 router = APIRouter(tags=["Threads"], dependencies=auth_dependency)
@@ -854,16 +855,18 @@ async def delete_thread(
     return {"status": "deleted"}
 
 
-@router.post("/threads/search", response_model=list[Thread])
+@router.post("/threads/search", response_model=None)
 async def search_threads(
     request: ThreadSearchRequest,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
-) -> list[Thread]:
+) -> list[dict[str, Any]]:
     """Search threads with filters.
 
-    Filter by status or metadata key-value pairs. Results are paginated via
-    `limit` and `offset` and ordered by creation time (newest first).
+    Filter by status, metadata, or thread `ids`; paginate via `limit`/`offset`.
+    Pass `select` to project the returned fields and `extract` to pull JSON
+    paths out of state/metadata into an `extracted` field (see issue #330).
+    Without `select`/`extract` the full thread shape is returned, unchanged.
     """
     # Authorization check
     ctx = build_auth_context(user, "threads", "search")
@@ -889,6 +892,10 @@ async def search_threads(
         # AssistantService.search_assistants for cross-endpoint consistency.
         stmt = stmt.where(ThreadORM.metadata_json.op("@>")(request.metadata))
 
+    if request.ids:
+        # Narrows within the user's own threads; ownership stays enforced above.
+        stmt = stmt.where(ThreadORM.thread_id.in_(request.ids))
+
     offset = request.offset or 0
     limit = request.limit or 20
     column, asc = _resolve_sort(request)
@@ -900,7 +907,8 @@ async def search_threads(
     result = await session.scalars(stmt)
     rows = result.all()
 
-    # Use safe serialization
-    threads_models = [_serialize_thread(t) for t in rows]
+    base_dicts = [_serialize_thread(t).model_dump(mode="json") for t in rows]
+    if not request.select and not request.extract:
+        return base_dicts
 
-    return threads_models
+    return await thread_search_projection.project(base_dicts, select=request.select, extract=request.extract)

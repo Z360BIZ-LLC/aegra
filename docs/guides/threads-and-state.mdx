@@ -134,7 +134,48 @@ threads = await client.threads.search(
     limit=20,
     offset=0,
 )
+
+# Filter to specific thread IDs
+threads = await client.threads.search(
+    ids=["thread-1", "thread-2"],
+)
 ```
+
+### Projecting and extracting fields
+
+To render a conversation list (title + last-message preview) in a **single** call —
+without fetching each thread's full state — use `select` and `extract`:
+
+```python
+# `select` whitelists the returned fields (smaller responses)
+threads = await client.threads.search(
+    select=["thread_id", "status", "metadata", "values"],
+)
+
+# `extract` pulls specific JSON paths into an `extracted` field
+threads = await client.threads.search(
+    select=["thread_id"],
+    extract={
+        "title": "values.messages[0].content",
+        "last_msg": "values.messages[-1].content",
+    },
+)
+# -> [{"thread_id": "...", "extracted": {"title": "...", "last_msg": "..."}}, ...]
+```
+
+- **`select`** — supported fields: `thread_id`, `status`, `created_at`, `updated_at`,
+  `metadata`, `values`. Omit `select` to get the full thread shape (backward compatible).
+- **`extract`** — maps an alias to a JSON path. Paths must start with `values.` or
+  `metadata.`, support dot keys and array indexing (`[0]`, `[-1]`), and are capped at 10.
+  A path that doesn't resolve yields `null`; a malformed path returns `422`.
+- Reading `values` requires decoding checkpoint state, so the server fetches only the
+  channels your paths reference (e.g. just `messages`) in one batched query — no N+1.
+
+<Note>
+The SDK fields `select=["config" | "context" | "interrupts"]` and filtering by state
+`values=...` are not yet supported and return `422`. Sorting by `state_updated_at` also
+returns `422` (use `updated_at`).
+</Note>
 
 ## Listing threads
 
