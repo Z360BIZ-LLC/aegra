@@ -292,10 +292,14 @@ def backfill_thread_state_cmd(limit: int | None, include_all: bool) -> None:
     )
 
     from aegra_api.core.database import db_manager
+    from aegra_api.services.langgraph_service import get_langgraph_service
     from aegra_api.services.state_backfill import backfill_thread_state
 
     async def _run() -> dict[str, int]:
         await db_manager.initialize()
+        # Load the graph registry from aegra.json (the app does this in lifespan);
+        # aget_state needs it to resolve each thread's graph.
+        await get_langgraph_service().initialize()
         try:
             return await backfill_thread_state(limit=limit, only_missing=not include_all)
         finally:
