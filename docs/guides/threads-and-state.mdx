@@ -172,11 +172,15 @@ threads = await client.threads.search(
 - **`select`** — supported fields: `thread_id`, `status`, `created_at`, `updated_at`,
   `metadata`, `values`, `interrupts`. Omit `select` to get the full thread shape
   (backward compatible).
-- **`extract`** — maps an alias to a JSON path. Paths must start with `values.`,
-  `metadata.`, or `interrupts.`, support dot keys and array indexing (`[0]`, `[-1]`),
-  and are capped at 10. A path that doesn't resolve yields `null`; a malformed path
-  returns `422`. Note `interrupts` is a mapping keyed by task id, so navigate it as
-  `interrupts.<task_id>[0].value` (not `interrupts[-1]`).
+- **`extract`** — maps an alias to a JSON path (dot keys + array indexing incl. `[-1]`),
+  capped at 10. Validation matches LangGraph: the path **root** must be `values`,
+  `metadata`, `config`, or `interrupts` (so `interrupts[-1].value` is accepted, not just
+  dotted forms). Anything that doesn't resolve — a malformed sub-path, a missing key, an
+  out-of-range/typed index — yields `null` (never a 422). `config` is accepted for parity
+  but always resolves `null` (Aegra doesn't materialize a config column).
+  Note `interrupts` is a **mapping keyed by task id** (matching the SDK), so `interrupts[-1]`
+  resolves to `null` — use `select:["interrupts"]` and read the map, or
+  `interrupts.<task_id>[0].value`.
 - `values`/`interrupts` are served from the thread's **materialized state** — the
   graph's logical state (`aget_state`), persisted to the thread row on run completion
   and state update. This matches `GET /threads/{id}/state` for every agent (including

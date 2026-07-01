@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import structlog
-from sqlalchemy import cast, func, select, type_coerce
+from sqlalchemy import cast, func, literal, select, type_coerce
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.types import UserDefinedType
 
@@ -42,9 +42,11 @@ def _to_jsonpath(segments: Sequence[str | int]) -> str:
     """Translate parsed path segments into a Postgres jsonpath string.
 
     Keys are always quoted (so hyphenated task ids etc. are safe); negative
-    indices map to ``[last]`` / ``[last-N]``.
+    indices map to ``[last]`` / ``[last-N]``. Uses ``strict`` mode so the DB
+    matches LangGraph's Python resolver: index only on arrays, key only on
+    objects — any type mismatch resolves to null (via silent=true at the call).
     """
-    parts = ["$"]
+    parts = ["strict $"]
     for seg in segments:
         if isinstance(seg, int):
             if seg >= 0:
@@ -75,7 +77,14 @@ class ThreadSearchProjectionService:
         keeps this decoupled from the ORM/handler.
         """
         select_set = set(select) if select is not None else None
-        parsed = {alias: parse_path(path) for alias, path in (extract or {}).items()}
+        # Parse leniently: a malformed sub-path (root already validated) resolves
+        # to null rather than erroring — matches LangGraph's resolver.
+        parsed: dict[str, list[str | int] | None] = {}
+        for alias, path in (extract or {}).items():
+            try:
+                parsed[alias] = parse_path(path)
+            except ValueError:
+                parsed[alias] = None
         wants_values = bool(select_set and "values" in select_set)
         wants_interrupts = bool(select_set and "interrupts" in select_set)
 
@@ -115,7 +124,7 @@ class ThreadSearchProjectionService:
 
     @staticmethod
     def _assemble_extracted(
-        parsed: dict[str, list[str | int]],
+        parsed: dict[str, list[str | int] | None],
         metadata: dict[str, Any],
         row: dict[str, Any],
         wants_values: bool,
@@ -124,6 +133,9 @@ class ThreadSearchProjectionService:
         extracted: dict[str, Any] = {}
         sql_extracted = row.get("extracted", {})
         for alias, segments in parsed.items():
+            if not segments:
+                extracted[alias] = None  # unparseable path (e.g. bad index) -> null
+                continue
             root = segments[0]
             if root == "metadata":
                 extracted[alias] = extract_value(metadata, segments[1:])
@@ -160,8 +172,13 @@ class ThreadSearchProjectionService:
             source = ThreadORM.values_json if alias in value_paths else ThreadORM.interrupts_json
             jsonpath = _to_jsonpath(segments[1:])
             label = f"ext{offset}"
+            # vars={} + silent=true → any strict-mode type mismatch yields null
+            # (never errors), matching LangGraph's resolver.
             columns.append(
-                type_coerce(func.jsonb_path_query_first(source, cast(jsonpath, _JsonPath())), JSONB).label(label)
+                type_coerce(
+                    func.jsonb_path_query_first(source, cast(jsonpath, _JsonPath()), literal({}, JSONB), True),
+                    JSONB,
+                ).label(label)
             )
             labels[label] = alias
 

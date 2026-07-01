@@ -56,19 +56,19 @@ async def _boom(*_a: Any, **_k: Any) -> dict[str, Any]:
 
 
 class TestToJsonPath:
-    """Segment -> Postgres jsonpath translation (the risky bit; verified vs PG e2e)."""
+    """Segment -> Postgres jsonpath translation (strict mode; verified vs PG e2e)."""
 
     def test_key_and_positive_index(self) -> None:
-        assert _to_jsonpath(["messages", 0, "content"]) == '$."messages"[0]."content"'
+        assert _to_jsonpath(["messages", 0, "content"]) == 'strict $."messages"[0]."content"'
 
     def test_negative_one_is_last(self) -> None:
-        assert _to_jsonpath(["messages", -1, "content"]) == '$."messages"[last]."content"'
+        assert _to_jsonpath(["messages", -1, "content"]) == 'strict $."messages"[last]."content"'
 
     def test_negative_n(self) -> None:
-        assert _to_jsonpath(["a", -2]) == '$."a"[last-1]'
+        assert _to_jsonpath(["a", -2]) == 'strict $."a"[last-1]'
 
     def test_hyphenated_key_quoted(self) -> None:
-        assert _to_jsonpath(["task-1", 0, "value"]) == '$."task-1"[0]."value"'
+        assert _to_jsonpath(["task-1", 0, "value"]) == 'strict $."task-1"[0]."value"'
 
 
 class TestProjectRouting:
@@ -136,3 +136,13 @@ class TestProjectRouting:
         out = await svc.project([_base("t1", {"title": "Hi"})], select=None, extract={"t": "metadata.title"})
         assert out[0]["user_id"] == "user-1"
         assert out[0]["extracted"] == {"t": "Hi"}
+
+    async def test_config_and_malformed_paths_resolve_null_without_fetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # config isn't materialized and a malformed sub-path is unparseable —
+        # both resolve to null, and neither needs a state fetch.
+        svc = ThreadSearchProjectionService()
+        monkeypatch.setattr(svc, "_fetch_projection", _boom)
+        out = await svc.project(
+            [_base("t1")], select=["thread_id"], extract={"c": "config.foo", "bad": "values.a[xyz]"}
+        )
+        assert out[0] == {"thread_id": "t1", "extracted": {"c": None, "bad": None}}

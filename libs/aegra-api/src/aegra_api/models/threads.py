@@ -1,11 +1,11 @@
 """Thread-related Pydantic models for Agent Protocol"""
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from aegra_api.utils.json_path import parse_path
 from aegra_api.utils.status_compat import validate_thread_status
 
 # Subset of the LangGraph SDK's ThreadSelectField that this server can project.
@@ -14,7 +14,19 @@ SUPPORTED_SELECT_FIELDS: frozenset[str] = frozenset(
 )
 # In the SDK literal but not implemented here yet — rejected with a clear 422.
 UNSUPPORTED_SELECT_FIELDS: frozenset[str] = frozenset({"config", "context"})
-_EXTRACT_PREFIXES: tuple[str, ...] = ("values.", "metadata.", "interrupts.")
+
+# extract validation, ported from LangGraph's langgraph_api.utils.extract so our
+# behavior matches theirs exactly: the path's ROOT (before the first '.' or '[')
+# must be an extractable column — e.g. `interrupts[-1].value` is accepted (root
+# `interrupts`), not just dotted `interrupts.`. `config` is accepted for parity
+# but resolves to null (Aegra doesn't materialize a config column). Sub-path
+# syntax is NOT validated here — a path that doesn't resolve yields null (lenient,
+# like LangGraph), never a 422.
+_EXTRACT_ROOTS: frozenset[str] = frozenset({"values", "metadata", "config", "interrupts"})
+_EXTRACT_ALIAS_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_RESERVED_EXTRACT_ALIASES: frozenset[str] = frozenset(
+    {"thread_id", "status", "created_at", "updated_at", "metadata", "config", "context", "values", "interrupts"}
+)
 _MAX_EXTRACT_PATHS = 10
 
 
@@ -102,8 +114,8 @@ class ThreadSearchRequest(BaseModel):
     )
     extract: dict[str, str] | None = Field(
         None,
-        description="Alias -> JSON path (e.g. 'values.messages[-1].content'). Paths must "
-        "start with 'values.', 'metadata.', or 'interrupts.'; max 10. Results land in 'extracted'.",
+        description="Alias -> JSON path (e.g. 'values.messages[-1].content'). Path root must be "
+        "values/metadata/config/interrupts; max 10. Unresolved paths yield null. Results in 'extracted'.",
     )
     values: dict[str, Any] | None = Field(
         None,
@@ -135,18 +147,23 @@ class ThreadSearchRequest(BaseModel):
     @field_validator("extract")
     @classmethod
     def validate_extract(cls, v: dict[str, str] | None) -> dict[str, str] | None:
-        """Enforce path count, allowed roots, and syntactic validity (422)."""
+        """Validate extract like LangGraph: alias is a safe identifier, not a
+        reserved field, and each path's ROOT is an extractable column. ≤10 paths.
+        Sub-path syntax isn't validated — unresolved paths yield null, not 422."""
         if v is None:
             return v
         if len(v) > _MAX_EXTRACT_PATHS:
             raise ValueError(f"extract supports at most {_MAX_EXTRACT_PATHS} paths")
         for alias, path in v.items():
-            if not isinstance(path, str) or not path.startswith(_EXTRACT_PREFIXES):
-                raise ValueError(f"extract path for '{alias}' must start with 'values.', 'metadata.', or 'interrupts.'")
-            try:
-                parse_path(path)
-            except ValueError as exc:
-                raise ValueError(f"invalid extract path for '{alias}': {exc}") from exc
+            if not _EXTRACT_ALIAS_RE.match(alias):
+                raise ValueError(f"extract key '{alias}' must be a valid identifier")
+            if alias in _RESERVED_EXTRACT_ALIASES:
+                raise ValueError(f"extract key '{alias}' cannot be a reserved field name")
+            if not isinstance(path, str) or not path:
+                raise ValueError(f"extract path for '{alias}' must be a non-empty string")
+            root = path.split(".")[0].split("[")[0]
+            if root not in _EXTRACT_ROOTS:
+                raise ValueError(f"extract path '{path}' must start with one of: {', '.join(sorted(_EXTRACT_ROOTS))}")
         return v
 
     @field_validator("values")

@@ -32,14 +32,27 @@ class TestExtractValidation:
         )
         assert set(req.extract) == {"a", "b", "c"}
 
-    @pytest.mark.parametrize("path", ["config.foo", "context.x", "foo.bar", "values", "metadata", "interrupts"])
-    def test_rejects_bad_prefix(self, path: str) -> None:
+    @pytest.mark.parametrize(
+        "path",
+        # Root-then-bracket (interrupts[-1]) and bare-root (values) are ACCEPTED —
+        # validation is root-based, matching LangGraph. config is accepted too.
+        ["interrupts[-1].value", "values[0]", "values", "config.foo", "values.messages[1"],
+    )
+    def test_accepts_langgraph_root_forms(self, path: str) -> None:
+        assert ThreadSearchRequest(extract={"a": path}).extract == {"a": path}
+
+    @pytest.mark.parametrize("path", ["context.x", "foo.bar", "notacolumn[0]"])
+    def test_rejects_unknown_root(self, path: str) -> None:
         with pytest.raises(ValidationError):
             ThreadSearchRequest(extract={"a": path})
 
-    def test_rejects_malformed_path(self) -> None:
+    def test_rejects_non_identifier_alias(self) -> None:
         with pytest.raises(ValidationError):
-            ThreadSearchRequest(extract={"a": "values.messages[1"})
+            ThreadSearchRequest(extract={"bad alias": "values.x"})
+
+    def test_rejects_reserved_alias(self) -> None:
+        with pytest.raises(ValidationError):
+            ThreadSearchRequest(extract={"status": "values.x"})
 
     def test_allows_exactly_ten_paths(self) -> None:
         req = ThreadSearchRequest(extract={f"a{i}": "values.x" for i in range(10)})
