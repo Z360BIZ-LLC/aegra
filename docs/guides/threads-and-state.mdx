@@ -192,10 +192,13 @@ threads = await client.threads.search(
   when you `select` the entire `values`/`interrupts`.
 
 <Note>
-Threads created before this feature (or whose last run predates it) have no
-materialized state and return empty `values`/`interrupts` until their next run.
-Backfill existing threads with `aegra db backfill-thread-state` (run off-peak — it
-loads each thread's graph).
+Threads created before this feature have no materialized state. On startup the
+server runs a **one-time backfill** automatically — guarded by an advisory lock
+(single runner) and a completion marker (never re-runs), and rate-limited so it
+won't stampede the DB. New threads materialize on run completion, so after the
+first pass nothing else is needed. To disable it and run manually instead, set
+`BACKFILL_THREAD_STATE_ON_STARTUP=false` and run `aegra db backfill-thread-state`
+(supports `--batch-size` / `--sleep`).
 </Note>
 
 <Note>

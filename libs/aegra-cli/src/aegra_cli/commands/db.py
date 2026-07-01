@@ -270,7 +270,15 @@ def history(verbose: bool) -> None:
     is_flag=True,
     help="Re-materialize every thread, not just those missing state.",
 )
-def backfill_thread_state_cmd(limit: int | None, include_all: bool) -> None:
+@click.option(
+    "--batch-size", type=int, default=50, help="Threads per batch before pausing (rate-limit)."
+)
+@click.option(
+    "--sleep", "sleep_s", type=float, default=1.0, help="Seconds to sleep between batches."
+)
+def backfill_thread_state_cmd(
+    limit: int | None, include_all: bool, batch_size: int, sleep_s: float
+) -> None:
     """Backfill materialized thread state (values/interrupts) for existing threads.
 
     Threads created before state materialization have empty search projections
@@ -301,7 +309,9 @@ def backfill_thread_state_cmd(limit: int | None, include_all: bool) -> None:
         # aget_state needs it to resolve each thread's graph.
         await get_langgraph_service().initialize()
         try:
-            return await backfill_thread_state(limit=limit, only_missing=not include_all)
+            return await backfill_thread_state(
+                limit=limit, only_missing=not include_all, batch_size=batch_size, sleep_s=sleep_s
+            )
         finally:
             await db_manager.close()
 
