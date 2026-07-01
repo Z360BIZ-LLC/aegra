@@ -134,7 +134,78 @@ threads = await client.threads.search(
     limit=20,
     offset=0,
 )
+
+# Filter to specific thread IDs
+threads = await client.threads.search(
+    ids=["thread-1", "thread-2"],
+)
 ```
+
+### Projecting and extracting fields
+
+To render a conversation list (title + last-message preview) in a **single** call —
+without fetching each thread's full state — use `select` and `extract`:
+
+```python
+# `select` whitelists the returned fields (smaller responses)
+threads = await client.threads.search(
+    select=["thread_id", "status", "metadata", "values"],
+)
+
+# `extract` pulls specific JSON paths into an `extracted` field
+threads = await client.threads.search(
+    select=["thread_id"],
+    extract={
+        "title": "values.messages[0].content",
+        "last_msg": "values.messages[-1].content",
+    },
+)
+# -> [{"thread_id": "...", "extracted": {"title": "...", "last_msg": "..."}}, ...]
+
+# `interrupts` returns the SDK shape {task_id: [Interrupt]} for the latest checkpoint
+threads = await client.threads.search(
+    select=["thread_id", "interrupts"],
+)
+# -> [{"thread_id": "...", "interrupts": {"<task_id>": [{"value": ..., "id": ...}]}}, ...]
+```
+
+- **`select`** — supported fields: `thread_id`, `status`, `created_at`, `updated_at`,
+  `metadata`, `values`, `interrupts`. Omit `select` to get the full thread shape
+  (backward compatible).
+- **`extract`** — maps an alias to a JSON path (dot keys + array indexing incl. `[-1]`),
+  capped at 10. Validation matches LangGraph: the path **root** must be `values`,
+  `metadata`, `config`, or `interrupts` (so `interrupts[-1].value` is accepted, not just
+  dotted forms). Anything that doesn't resolve — a malformed sub-path, a missing key, an
+  out-of-range/typed index — yields `null` (never a 422). `config` is accepted for parity
+  but always resolves `null` (Aegra doesn't materialize a config column).
+  Note `interrupts` is a **mapping keyed by task id** (matching the SDK), so `interrupts[-1]`
+  resolves to `null` — use `select:["interrupts"]` and read the map, or
+  `interrupts.<task_id>[0].value`.
+- `values`/`interrupts` are served from the thread's **materialized state** — the
+  graph's logical state (`aget_state`), persisted to the thread row on run completion
+  and state update. This matches `GET /threads/{id}/state` for every agent (including
+  middleware/subgraph agents whose messages aren't recoverable from raw checkpoint
+  blobs), with no per-thread graph replay and no N+1.
+- Because the state is real JSONB, `extract` paths are resolved **in Postgres**
+  (`jsonb_path_query_first`): the DB returns only the referenced value (e.g. just the
+  last message content), not the whole state. The full state column is transferred only
+  when you `select` the entire `values`/`interrupts`.
+
+<Note>
+Threads created before this feature have no materialized state. On startup the
+server runs a **one-time backfill** automatically — guarded by an advisory lock
+(single runner) and a completion marker (never re-runs), and rate-limited so it
+won't stampede the DB. New threads materialize on run completion, so after the
+first pass nothing else is needed. To disable it and run manually instead, set
+`BACKFILL_THREAD_STATE_ON_STARTUP=false` and run `aegra db backfill-thread-state`
+(supports `--batch-size` / `--sleep`).
+</Note>
+
+<Note>
+The SDK fields `select=["config" | "context"]` and filtering by state `values=...` are
+not yet supported and return `422`. Sorting by `state_updated_at` also returns `422`
+(use `updated_at`).
+</Note>
 
 ## Listing threads
 

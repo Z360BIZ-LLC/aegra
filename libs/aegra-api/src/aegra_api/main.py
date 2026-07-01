@@ -41,6 +41,7 @@ from aegra_api.services.cron_scheduler import cron_scheduler
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
+from aegra_api.services.state_backfill import run_startup_backfill
 from aegra_api.settings import settings
 from aegra_api.utils.setup_logging import setup_logging
 
@@ -171,6 +172,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if settings.cron.CRON_ENABLED:
         await cron_scheduler.start()
 
+    # One-time materialized-state backfill for pre-existing threads. Runs in the
+    # background (never blocks startup); guarded by an advisory lock + completion
+    # marker so only one instance runs it and only until it's done once.
+    backfill_task_handle: asyncio.Task | None = None
+    if settings.app.BACKFILL_THREAD_STATE_ON_STARTUP:
+        backfill_task_handle = asyncio.create_task(
+            run_startup_backfill(
+                batch_size=settings.app.BACKFILL_BATCH_SIZE,
+                sleep_s=settings.app.BACKFILL_BATCH_SLEEP_S,
+            ),
+            name="thread_state_backfill",
+        )
+
     # Schedule the heartbeat task last, after all init is complete. The sidecar
     # has been answering with a fresh (just-initialized) heartbeat the entire
     # time; from here on, real loop ticks keep it fresh.
@@ -184,6 +198,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     heartbeat_task_handle.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await heartbeat_task_handle
+
+    # Stop the backfill task if it's still running (advisory lock releases with
+    # the connection, so a later boot can resume it).
+    if backfill_task_handle is not None and not backfill_task_handle.done():
+        backfill_task_handle.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await backfill_task_handle
 
     # Shutdown order: cron → reaper → executor (drains jobs) → broker → Redis → DB
     if settings.cron.CRON_ENABLED:

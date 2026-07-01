@@ -148,6 +148,14 @@ class Thread(Base):
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
+    # Materialized graph state (LangGraph Platform parity). Populated from
+    # aget_state on run completion + state update, so /threads/search can
+    # project values/interrupts without graph-aware checkpoint replay. Deferred:
+    # the (potentially large) JSONB is not loaded on ordinary thread listings.
+    values_json: Mapped[dict | None] = mapped_column("values", JsonbSafe, nullable=True, deferred=True)
+    interrupts_json: Mapped[dict | None] = mapped_column("interrupts", JsonbSafe, nullable=True, deferred=True)
+    state_updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
     # Indexes for performance. Composite (user_id, <sort> DESC) indexes back
     # POST /threads/search default-sort and frontend updated_at sort paths
     # without a separate in-memory sort step. GIN index on metadata_json is

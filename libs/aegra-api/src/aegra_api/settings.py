@@ -101,6 +101,15 @@ class AppSettings(EnvBase):
     # run migrations out-of-band via `aegra db upgrade`.
     RUN_MIGRATIONS_ON_STARTUP: bool = True
 
+    # One-time backfill of materialized thread state on startup (for threads
+    # created before the feature). Runs at most once per environment: guarded by
+    # a Postgres advisory lock (single runner) and a completion marker (never
+    # re-runs), rate-limited by batch size + inter-batch sleep. New threads
+    # materialize on run completion, so after the first pass this is a no-op.
+    BACKFILL_THREAD_STATE_ON_STARTUP: bool = True
+    BACKFILL_BATCH_SIZE: int = 50
+    BACKFILL_BATCH_SLEEP_S: float = 1.0
+
     # Logging
     LOG_LEVEL: UpperStr = "INFO"
     LOG_VERBOSITY: LowerStr = "verbose"

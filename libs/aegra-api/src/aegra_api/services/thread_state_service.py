@@ -90,6 +90,23 @@ class ThreadStateService:
 
         return thread_states
 
+    def materialize_state(self, snapshot: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Extract JSON-safe (values, interrupts) from a snapshot for persisting
+        onto the thread row.
+
+        `values` is the graph's logical state (same as GET /state). `interrupts`
+        uses the SDK shape {task_id: [Interrupt]}, so /threads/search projects it
+        directly. Serialized via LangGraphSerializer so LangChain objects become
+        plain JSON.
+        """
+        values = self.serializer.serialize(getattr(snapshot, "values", {}) or {})
+        interrupts: dict[str, Any] = {}
+        for task in getattr(snapshot, "tasks", None) or []:
+            task_interrupts = getattr(task, "interrupts", None)
+            if task_interrupts:
+                interrupts[task.id] = self.serializer.serialize(list(task_interrupts))
+        return values, interrupts
+
     def _extract_created_at(self, snapshot: Any) -> datetime | None:
         """Extract created_at timestamp from snapshot"""
         created_at = getattr(snapshot, "created_at", None)

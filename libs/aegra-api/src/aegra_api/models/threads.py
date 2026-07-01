@@ -1,11 +1,33 @@
 """Thread-related Pydantic models for Agent Protocol"""
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from aegra_api.utils.status_compat import validate_thread_status
+
+# Subset of the LangGraph SDK's ThreadSelectField that this server can project.
+SUPPORTED_SELECT_FIELDS: frozenset[str] = frozenset(
+    {"thread_id", "status", "created_at", "updated_at", "metadata", "values", "interrupts"}
+)
+# In the SDK literal but not implemented here yet — rejected with a clear 422.
+UNSUPPORTED_SELECT_FIELDS: frozenset[str] = frozenset({"config", "context"})
+
+# extract validation, ported from LangGraph's langgraph_api.utils.extract so our
+# behavior matches theirs exactly: the path's ROOT (before the first '.' or '[')
+# must be an extractable column — e.g. `interrupts[-1].value` is accepted (root
+# `interrupts`), not just dotted `interrupts.`. `config` is accepted for parity
+# but resolves to null (Aegra doesn't materialize a config column). Sub-path
+# syntax is NOT validated here — a path that doesn't resolve yields null (lenient,
+# like LangGraph), never a 422.
+_EXTRACT_ROOTS: frozenset[str] = frozenset({"values", "metadata", "config", "interrupts"})
+_EXTRACT_ALIAS_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_RESERVED_EXTRACT_ALIASES: frozenset[str] = frozenset(
+    {"thread_id", "status", "created_at", "updated_at", "metadata", "config", "context", "values", "interrupts"}
+)
+_MAX_EXTRACT_PATHS = 10
 
 
 class ThreadCreate(BaseModel):
@@ -84,6 +106,21 @@ class ThreadSearchRequest(BaseModel):
         None,
         description="Sort direction (SDK-compatible). Defaults to 'desc' when sort_by is set.",
     )
+    ids: list[str] | None = Field(None, description="Restrict results to these thread IDs.")
+    select: list[str] | None = Field(
+        None,
+        description="Fields to include in each result. Supported: thread_id, status, "
+        "created_at, updated_at, metadata, values, interrupts. Absent = full thread.",
+    )
+    extract: dict[str, str] | None = Field(
+        None,
+        description="Alias -> JSON path (e.g. 'values.messages[-1].content'). Path root must be "
+        "values/metadata/config/interrupts; max 10. Unresolved paths yield null. Results in 'extracted'.",
+    )
+    values: dict[str, Any] | None = Field(
+        None,
+        description="SDK state-value filter — not supported; a non-empty value returns 422.",
+    )
 
     @field_validator("status")
     @classmethod
@@ -91,6 +128,51 @@ class ThreadSearchRequest(BaseModel):
         """Validate status filter conforms to API specification."""
         if v is not None:
             return validate_thread_status(v)
+        return v
+
+    @field_validator("select")
+    @classmethod
+    def validate_select(cls, v: list[str] | None) -> list[str] | None:
+        """Reject unknown fields, and SDK fields we don't implement yet (422)."""
+        if v is None:
+            return v
+        for field in v:
+            if field in SUPPORTED_SELECT_FIELDS:
+                continue
+            if field in UNSUPPORTED_SELECT_FIELDS:
+                raise ValueError(f"select field '{field}' is not supported yet")
+            raise ValueError(f"unknown select field '{field}'")
+        return v
+
+    @field_validator("extract")
+    @classmethod
+    def validate_extract(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        """Validate extract like LangGraph: alias is a safe identifier, not a
+        reserved field, and each path's ROOT is an extractable column. ≤10 paths.
+        Sub-path syntax isn't validated — unresolved paths yield null, not 422."""
+        if v is None:
+            return v
+        if len(v) > _MAX_EXTRACT_PATHS:
+            raise ValueError(f"extract supports at most {_MAX_EXTRACT_PATHS} paths")
+        for alias, path in v.items():
+            if not _EXTRACT_ALIAS_RE.match(alias):
+                raise ValueError(f"extract key '{alias}' must be a valid identifier")
+            if alias in _RESERVED_EXTRACT_ALIASES:
+                raise ValueError(f"extract key '{alias}' cannot be a reserved field name")
+            if not isinstance(path, str) or not path:
+                raise ValueError(f"extract path for '{alias}' must be a non-empty string")
+            root = path.split(".")[0].split("[")[0]
+            if root not in _EXTRACT_ROOTS:
+                raise ValueError(f"extract path '{path}' must start with one of: {', '.join(sorted(_EXTRACT_ROOTS))}")
+        return v
+
+    @field_validator("values")
+    @classmethod
+    def reject_values_filter(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        """State-value filtering would require decoding every candidate's blobs;
+        decline explicitly instead of silently ignoring it."""
+        if v:
+            raise ValueError("filtering threads by state 'values' is not supported")
         return v
 
 
