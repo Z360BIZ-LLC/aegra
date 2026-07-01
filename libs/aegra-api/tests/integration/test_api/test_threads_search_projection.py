@@ -91,6 +91,20 @@ class TestExtractValues:
         assert fetch.call_args.args[1] == ["messages"]
 
 
+class TestInterrupts:
+    """select=['interrupts'] returns the SDK-shaped {task_id: [Interrupt]} map."""
+
+    def test_select_interrupts(self) -> None:
+        client = _client([_thread_row("t1")])
+        interrupts = {"t1": {"task-1": [{"value": {"q": "confirm?"}, "id": "i1"}]}}
+        with patch.object(thread_search_projection, "_fetch_interrupts", new=AsyncMock(return_value=interrupts)):
+            resp = client.post("/threads/search", json={"select": ["thread_id", "interrupts"]})
+        assert resp.status_code == 200
+        assert resp.json() == [
+            {"thread_id": "t1", "interrupts": {"task-1": [{"value": {"q": "confirm?"}, "id": "i1"}]}}
+        ]
+
+
 class TestUnsupportedParams:
     """SDK params Aegra can't honour fail loudly with 422."""
 
@@ -101,7 +115,7 @@ class TestUnsupportedParams:
 
     def test_unsupported_select_field_returns_422(self) -> None:
         client = _client([_thread_row("t1")])
-        resp = client.post("/threads/search", json={"select": ["interrupts"]})
+        resp = client.post("/threads/search", json={"select": ["config"]})
         assert resp.status_code == 422
 
     def test_too_many_extract_paths_returns_422(self) -> None:

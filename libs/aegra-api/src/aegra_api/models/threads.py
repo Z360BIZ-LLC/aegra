@@ -10,11 +10,11 @@ from aegra_api.utils.status_compat import validate_thread_status
 
 # Subset of the LangGraph SDK's ThreadSelectField that this server can project.
 SUPPORTED_SELECT_FIELDS: frozenset[str] = frozenset(
-    {"thread_id", "status", "created_at", "updated_at", "metadata", "values"}
+    {"thread_id", "status", "created_at", "updated_at", "metadata", "values", "interrupts"}
 )
 # In the SDK literal but not implemented here yet — rejected with a clear 422.
-UNSUPPORTED_SELECT_FIELDS: frozenset[str] = frozenset({"config", "context", "interrupts"})
-_EXTRACT_PREFIXES: tuple[str, ...] = ("values.", "metadata.")
+UNSUPPORTED_SELECT_FIELDS: frozenset[str] = frozenset({"config", "context"})
+_EXTRACT_PREFIXES: tuple[str, ...] = ("values.", "metadata.", "interrupts.")
 _MAX_EXTRACT_PATHS = 10
 
 
@@ -98,12 +98,12 @@ class ThreadSearchRequest(BaseModel):
     select: list[str] | None = Field(
         None,
         description="Fields to include in each result. Supported: thread_id, status, "
-        "created_at, updated_at, metadata, values. Absent = full thread.",
+        "created_at, updated_at, metadata, values, interrupts. Absent = full thread.",
     )
     extract: dict[str, str] | None = Field(
         None,
         description="Alias -> JSON path (e.g. 'values.messages[-1].content'). Paths must "
-        "start with 'values.' or 'metadata.'; max 10. Results land in 'extracted'.",
+        "start with 'values.', 'metadata.', or 'interrupts.'; max 10. Results land in 'extracted'.",
     )
     values: dict[str, Any] | None = Field(
         None,
@@ -142,7 +142,7 @@ class ThreadSearchRequest(BaseModel):
             raise ValueError(f"extract supports at most {_MAX_EXTRACT_PATHS} paths")
         for alias, path in v.items():
             if not isinstance(path, str) or not path.startswith(_EXTRACT_PREFIXES):
-                raise ValueError(f"extract path for '{alias}' must start with 'values.' or 'metadata.'")
+                raise ValueError(f"extract path for '{alias}' must start with 'values.', 'metadata.', or 'interrupts.'")
             try:
                 parse_path(path)
             except ValueError as exc:

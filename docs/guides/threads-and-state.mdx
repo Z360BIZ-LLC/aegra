@@ -161,20 +161,30 @@ threads = await client.threads.search(
     },
 )
 # -> [{"thread_id": "...", "extracted": {"title": "...", "last_msg": "..."}}, ...]
+
+# `interrupts` returns the SDK shape {task_id: [Interrupt]} for the latest checkpoint
+threads = await client.threads.search(
+    select=["thread_id", "interrupts"],
+)
+# -> [{"thread_id": "...", "interrupts": {"<task_id>": [{"value": ..., "id": ...}]}}, ...]
 ```
 
 - **`select`** — supported fields: `thread_id`, `status`, `created_at`, `updated_at`,
-  `metadata`, `values`. Omit `select` to get the full thread shape (backward compatible).
-- **`extract`** — maps an alias to a JSON path. Paths must start with `values.` or
-  `metadata.`, support dot keys and array indexing (`[0]`, `[-1]`), and are capped at 10.
-  A path that doesn't resolve yields `null`; a malformed path returns `422`.
-- Reading `values` requires decoding checkpoint state, so the server fetches only the
-  channels your paths reference (e.g. just `messages`) in one batched query — no N+1.
+  `metadata`, `values`, `interrupts`. Omit `select` to get the full thread shape
+  (backward compatible).
+- **`extract`** — maps an alias to a JSON path. Paths must start with `values.`,
+  `metadata.`, or `interrupts.`, support dot keys and array indexing (`[0]`, `[-1]`),
+  and are capped at 10. A path that doesn't resolve yields `null`; a malformed path
+  returns `422`. Note `interrupts` is a mapping keyed by task id, so navigate it as
+  `interrupts.<task_id>[0].value` (not `interrupts[-1]`).
+- Reading `values`/`interrupts` requires decoding checkpoint state, so the server
+  fetches only the channels your paths reference (e.g. just `messages`) in one batched
+  query — no N+1.
 
 <Note>
-The SDK fields `select=["config" | "context" | "interrupts"]` and filtering by state
-`values=...` are not yet supported and return `422`. Sorting by `state_updated_at` also
-returns `422` (use `updated_at`).
+The SDK fields `select=["config" | "context"]` and filtering by state `values=...` are
+not yet supported and return `422`. Sorting by `state_updated_at` also returns `422`
+(use `updated_at`).
 </Note>
 
 ## Listing threads

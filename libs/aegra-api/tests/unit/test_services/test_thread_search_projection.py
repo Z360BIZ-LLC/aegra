@@ -103,6 +103,45 @@ async def test_extract_without_select_keeps_full_base(monkeypatch: pytest.Monkey
     assert out[0]["extracted"] == {"t": "Hi"}
 
 
+async def test_select_interrupts_attaches_sdk_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = ThreadSearchProjectionService()
+    interrupts = {"t1": {"task-1": [{"value": {"q": "confirm?"}, "id": "i1"}]}}
+
+    async def _fake(thread_ids: list[str]) -> dict[str, dict[str, Any]]:
+        return interrupts
+
+    monkeypatch.setattr(svc, "_fetch_interrupts", _fake)
+    out = await svc.project([_base("t1")], select=["thread_id", "interrupts"], extract=None)
+    assert out[0] == {"thread_id": "t1", "interrupts": {"task-1": [{"value": {"q": "confirm?"}, "id": "i1"}]}}
+
+
+async def test_interrupts_extract_by_task_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = ThreadSearchProjectionService()
+
+    async def _boom_values(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise AssertionError("interrupts-only extract must not read values")
+
+    async def _fake_interrupts(thread_ids: list[str]) -> dict[str, dict[str, Any]]:
+        return {"t1": {"task-1": [{"value": {"q": "confirm?"}, "id": "i1"}]}}
+
+    monkeypatch.setattr(svc, "_fetch_values", _boom_values)
+    monkeypatch.setattr(svc, "_fetch_interrupts", _fake_interrupts)
+    out = await svc.project([_base("t1")], select=["thread_id"], extract={"q": "interrupts.task-1[0].value.q"})
+    assert out[0] == {"thread_id": "t1", "extracted": {"q": "confirm?"}}
+
+
+async def test_thread_without_interrupts_yields_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = ThreadSearchProjectionService()
+
+    async def _none(thread_ids: list[str]) -> dict[str, dict[str, Any]]:
+        return {}
+
+    monkeypatch.setattr(svc, "_fetch_interrupts", _none)
+    out = await svc.project([_base("t1")], select=["thread_id", "interrupts"], extract={"x": "interrupts.t[0]"})
+    assert out[0]["interrupts"] == {}
+    assert out[0]["extracted"] == {"x": None}
+
+
 class TestDecodeRow:
     """_decode_row reconstructs state like the checkpointer: inline + blobs."""
 

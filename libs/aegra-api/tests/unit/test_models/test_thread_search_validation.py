@@ -10,10 +10,10 @@ class TestSelectValidation:
     """select accepts the supported subset and rejects the rest with 422."""
 
     def test_accepts_supported_fields(self) -> None:
-        fields = ["thread_id", "status", "created_at", "updated_at", "metadata", "values"]
+        fields = ["thread_id", "status", "created_at", "updated_at", "metadata", "values", "interrupts"]
         assert ThreadSearchRequest(select=fields).select == fields
 
-    @pytest.mark.parametrize("field", ["config", "context", "interrupts"])
+    @pytest.mark.parametrize("field", ["config", "context"])
     def test_rejects_known_unsupported_sdk_field(self, field: str) -> None:
         with pytest.raises(ValidationError):
             ThreadSearchRequest(select=[field])
@@ -26,11 +26,13 @@ class TestSelectValidation:
 class TestExtractValidation:
     """extract enforces prefix, count, and syntactic validity."""
 
-    def test_accepts_values_and_metadata_paths(self) -> None:
-        req = ThreadSearchRequest(extract={"a": "values.messages[-1].content", "b": "metadata.title"})
-        assert set(req.extract) == {"a", "b"}
+    def test_accepts_values_metadata_and_interrupts_paths(self) -> None:
+        req = ThreadSearchRequest(
+            extract={"a": "values.messages[-1].content", "b": "metadata.title", "c": "interrupts.task-1[0].value"}
+        )
+        assert set(req.extract) == {"a", "b", "c"}
 
-    @pytest.mark.parametrize("path", ["config.foo", "interrupts.x", "foo.bar", "values", "metadata"])
+    @pytest.mark.parametrize("path", ["config.foo", "context.x", "foo.bar", "values", "metadata", "interrupts"])
     def test_rejects_bad_prefix(self, path: str) -> None:
         with pytest.raises(ValidationError):
             ThreadSearchRequest(extract={"a": path})
