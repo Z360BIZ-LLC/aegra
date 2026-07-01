@@ -54,11 +54,11 @@ class TestSelectProjection:
 
 
 class TestExtractMetadata:
-    """metadata.* extract resolves from the thread row without a checkpoint read."""
+    """metadata.* extract resolves from the thread row without a state read."""
 
     def test_extract_metadata_path(self) -> None:
         client = _client([_thread_row("t1", metadata={"title": "Hello world"})])
-        with patch.object(thread_search_projection, "_fetch_values", new=AsyncMock()) as fetch:
+        with patch.object(thread_search_projection, "_fetch_projection", new=AsyncMock()) as fetch:
             resp = client.post(
                 "/threads/search",
                 json={"select": ["thread_id"], "extract": {"title": "metadata.title"}},
@@ -69,12 +69,14 @@ class TestExtractMetadata:
 
 
 class TestExtractValues:
-    """values.* extract decodes state (mocked) and resolves the path."""
+    """values.* extract resolves via SQL path extraction (mocked here)."""
 
     def test_extract_first_and_last_message(self) -> None:
         client = _client([_thread_row("t1")])
-        decoded = {"t1": {"messages": [{"content": "first"}, {"content": "last"}]}}
-        with patch.object(thread_search_projection, "_fetch_values", new=AsyncMock(return_value=decoded)) as fetch:
+        projection = {"t1": {"values": None, "interrupts": None, "extracted": {"title": "first", "last_msg": "last"}}}
+        with patch.object(
+            thread_search_projection, "_fetch_projection", new=AsyncMock(return_value=projection)
+        ) as fetch:
             resp = client.post(
                 "/threads/search",
                 json={
@@ -87,8 +89,9 @@ class TestExtractValues:
             )
         assert resp.status_code == 200
         assert resp.json() == [{"thread_id": "t1", "extracted": {"title": "first", "last_msg": "last"}}]
-        # Only the `messages` channel is needed, so the fetch is pruned to it.
-        assert fetch.call_args.args[1] == ["messages"]
+        # Full column not selected → paths resolved in SQL, values column not fetched.
+        assert fetch.call_args.kwargs["want_values"] is False
+        assert set(fetch.call_args.kwargs["value_paths"]) == {"title", "last_msg"}
 
 
 class TestInterrupts:
@@ -96,8 +99,8 @@ class TestInterrupts:
 
     def test_select_interrupts(self) -> None:
         client = _client([_thread_row("t1")])
-        interrupts = {"t1": {"task-1": [{"value": {"q": "confirm?"}, "id": "i1"}]}}
-        with patch.object(thread_search_projection, "_fetch_interrupts", new=AsyncMock(return_value=interrupts)):
+        projection = {"t1": {"values": None, "interrupts": {"task-1": [{"value": {"q": "confirm?"}, "id": "i1"}]}}}
+        with patch.object(thread_search_projection, "_fetch_projection", new=AsyncMock(return_value=projection)):
             resp = client.post("/threads/search", json={"select": ["thread_id", "interrupts"]})
         assert resp.status_code == 200
         assert resp.json() == [

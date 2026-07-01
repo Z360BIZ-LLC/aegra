@@ -79,32 +79,43 @@ async def finalize_run(
     thread_status: str,
     output: Any = None,
     error: str | None = None,
+    persist_state: bool = False,
+    materialized_values: dict[str, Any] | None = None,
+    materialized_interrupts: dict[str, Any] | None = None,
 ) -> None:
     """Update run status + thread status in a single transaction.
 
     Batches two UPDATE statements into one DB round-trip instead of
     opening separate sessions for update_run_status and set_thread_status.
+
+    When ``persist_state`` is set, the thread's materialized state (values +
+    interrupts + state_updated_at) is written in the same transaction so
+    /threads/search can project it. On error/cancel it is left untouched
+    (stale-but-valid) rather than clobbered.
     """
     validated_run = validate_run_status(status)
     validated_thread = validate_thread_status(thread_status)
+    now = datetime.now(UTC)
     maker = _get_session_maker()
 
     run_values: dict[str, Any] = {
         "status": validated_run,
-        "updated_at": datetime.now(UTC),
+        "updated_at": now,
     }
     if output is not None:
         run_values["output"] = _safe_serialize(output, run_id)
     if error is not None:
         run_values["error_message"] = error
 
+    thread_values: dict[str, Any] = {"status": validated_thread, "updated_at": now}
+    if persist_state:
+        thread_values["values_json"] = materialized_values or {}
+        thread_values["interrupts_json"] = materialized_interrupts or {}
+        thread_values["state_updated_at"] = now
+
     async with maker() as session:
         await session.execute(update(RunORM).where(RunORM.run_id == run_id).values(**run_values))
-        await session.execute(
-            update(ThreadORM)
-            .where(ThreadORM.thread_id == thread_id)
-            .values(status=validated_thread, updated_at=datetime.now(UTC))
-        )
+        await session.execute(update(ThreadORM).where(ThreadORM.thread_id == thread_id).values(**thread_values))
         await session.commit()
 
     logger.info("Finalized run", run_id=run_id, status=validated_run, thread_status=validated_thread)

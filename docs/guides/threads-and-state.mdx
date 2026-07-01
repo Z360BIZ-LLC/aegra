@@ -177,9 +177,22 @@ threads = await client.threads.search(
   and are capped at 10. A path that doesn't resolve yields `null`; a malformed path
   returns `422`. Note `interrupts` is a mapping keyed by task id, so navigate it as
   `interrupts.<task_id>[0].value` (not `interrupts[-1]`).
-- Reading `values`/`interrupts` requires decoding checkpoint state, so the server
-  fetches only the channels your paths reference (e.g. just `messages`) in one batched
-  query — no N+1.
+- `values`/`interrupts` are served from the thread's **materialized state** — the
+  graph's logical state (`aget_state`), persisted to the thread row on run completion
+  and state update. This matches `GET /threads/{id}/state` for every agent (including
+  middleware/subgraph agents whose messages aren't recoverable from raw checkpoint
+  blobs), with no per-thread graph replay and no N+1.
+- Because the state is real JSONB, `extract` paths are resolved **in Postgres**
+  (`jsonb_path_query_first`): the DB returns only the referenced value (e.g. just the
+  last message content), not the whole state. The full state column is transferred only
+  when you `select` the entire `values`/`interrupts`.
+
+<Note>
+Threads created before this feature (or whose last run predates it) have no
+materialized state and return empty `values`/`interrupts` until their next run.
+Backfill existing threads with `aegra db backfill-thread-state` (run off-peak — it
+loads each thread's graph).
+</Note>
 
 <Note>
 The SDK fields `select=["config" | "context"]` and filtering by state `values=...` are

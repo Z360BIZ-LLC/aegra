@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.active_runs import active_runs
@@ -145,6 +145,25 @@ def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | 
             "updated_at": u_at,
         }
     )
+
+
+async def _materialize_thread_state_row(agent: Any, thread_id: str, user: User, session: AsyncSession) -> None:
+    """Persist the thread's current logical state (values + interrupts) onto the
+    thread row so /threads/search can project it. Best-effort — never raises."""
+    from aegra_api.services.langgraph_service import create_thread_config
+
+    try:
+        config = create_thread_config(thread_id, user)
+        snapshot = await agent.aget_state(config)
+        values, interrupts = thread_state_service.materialize_state(snapshot)
+        await session.execute(
+            update(ThreadORM)
+            .where(ThreadORM.thread_id == thread_id)
+            .values(values_json=values, interrupts_json=interrupts, state_updated_at=datetime.now(UTC))
+        )
+        await session.commit()
+    except Exception:
+        logger.warning("Thread state materialization after update failed (best-effort)", thread_id=thread_id)
 
 
 # --- Endpoints ---
@@ -521,6 +540,10 @@ async def update_thread_state(
                         exc_info=True,
                     )
                     raise
+
+                # Re-materialize the thread's state onto the thread row so
+                # /threads/search projects the new state (best-effort).
+                await _materialize_thread_state_row(agent, thread_id, user, session)
 
                 # Extract checkpoint info from the updated config
                 # aupdate_state returns the updated config dict

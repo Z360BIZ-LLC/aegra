@@ -2,7 +2,7 @@
 
 import pytest
 
-from aegra_api.utils.json_path import extract_value, parse_path, top_level_channel
+from aegra_api.utils.json_path import extract_value, parse_path
 
 
 class TestParsePath:
@@ -55,19 +55,3 @@ class TestExtractValue:
 
     def test_empty_segments_returns_input(self) -> None:
         assert extract_value({"a": 1}, []) == {"a": 1}
-
-
-class TestTopLevelChannel:
-    """top_level_channel narrows a values.* path to one channel, else None."""
-
-    def test_values_key(self) -> None:
-        assert top_level_channel(["values", "messages", -1]) == "messages"
-
-    def test_metadata_root_returns_none(self) -> None:
-        assert top_level_channel(["metadata", "title"]) is None
-
-    def test_values_index_returns_none(self) -> None:
-        assert top_level_channel(["values", 0]) is None
-
-    def test_values_only_returns_none(self) -> None:
-        assert top_level_channel(["values"]) is None

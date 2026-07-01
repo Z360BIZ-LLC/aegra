@@ -75,14 +75,3 @@ def extract_value(data: Any, segments: Sequence[str | int]) -> Any:
                 return None
             current = current[seg]
     return current
-
-
-def top_level_channel(segments: Sequence[str | int]) -> str | None:
-    """Channel a ``values.*`` path targets, used to prune the blob fetch.
-
-    Returns the key directly under the ``values`` root, or None when the path
-    can't be narrowed to a single channel (so the caller fetches all).
-    """
-    if len(segments) >= 2 and segments[0] == "values" and isinstance(segments[1], str):
-        return segments[1]
-    return None

@@ -7,6 +7,7 @@ Single source of truth for executing a graph run. Both LocalExecutor
 """
 
 import asyncio
+import json
 from time import perf_counter
 from typing import Any
 
@@ -19,9 +20,14 @@ from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.graph_streaming import stream_graph_events
-from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
+from aegra_api.services.langgraph_service import (
+    create_run_config,
+    create_thread_config,
+    get_langgraph_service,
+)
 from aegra_api.services.run_status import finalize_run, update_run_status
 from aegra_api.services.streaming_service import streaming_service
+from aegra_api.services.thread_state_service import ThreadStateService
 from aegra_api.services.webhook_service import send_run_webhook
 from aegra_api.settings import settings
 from aegra_api.utils.run_utils import map_command_to_langgraph
@@ -29,6 +35,10 @@ from aegra_api.utils.run_utils import map_command_to_langgraph
 logger = structlog.getLogger(__name__)
 
 _DEFAULT_STREAM_MODES = ["values"]
+_thread_state_service = ThreadStateService()
+# Skip materialization for pathologically large states — the bytes already live
+# in checkpoints; bloating the thread row would slow the search read path too.
+_MAX_MATERIALIZED_STATE_BYTES = 4_000_000
 
 # Run IDs whose cancellation was triggered by lease loss (not user action).
 # When a heartbeat detects lease loss, it adds the run_id here before
@@ -71,6 +81,9 @@ async def execute_run(job: RunJob) -> None:
                 status="interrupted",
                 thread_status="interrupted",
                 output=final_output.data,
+                persist_state=final_output.materialized,
+                materialized_values=final_output.state_values,
+                materialized_interrupts=final_output.state_interrupts,
             )
             _emit_run_terminal_metrics(job, "interrupted", started_at)
             await _send_run_webhook(job, "interrupted", final_output.data)
@@ -81,6 +94,9 @@ async def execute_run(job: RunJob) -> None:
                 status="success",
                 thread_status="idle",
                 output=final_output.data,
+                persist_state=final_output.materialized,
+                materialized_values=final_output.state_values,
+                materialized_interrupts=final_output.state_interrupts,
             )
             _emit_run_terminal_metrics(job, "success", started_at)
             await _send_run_webhook(job, "completed", final_output.data)
@@ -195,11 +211,14 @@ async def _send_run_webhook(
 class _GraphResult:
     """Accumulates output and interrupt state during graph streaming."""
 
-    __slots__ = ("data", "has_interrupt")
+    __slots__ = ("data", "has_interrupt", "materialized", "state_values", "state_interrupts")
 
     def __init__(self) -> None:
         self.data: dict[str, Any] = {}
         self.has_interrupt: bool = False
+        self.materialized: bool = False
+        self.state_values: dict[str, Any] = {}
+        self.state_interrupts: dict[str, Any] = {}
 
 
 async def _stream_graph(job: RunJob) -> _GraphResult:
@@ -240,7 +259,33 @@ async def _stream_graph(job: RunJob) -> _GraphResult:
             if event_type.startswith("values"):
                 result.data = event_data
 
+        # Still inside the graph context (checkpointer attached): capture the
+        # graph's logical state to materialize onto the thread row.
+        await _materialize_thread_state(graph, job, result)
+
     return result
+
+
+async def _materialize_thread_state(graph: Any, job: RunJob, result: _GraphResult) -> None:
+    """Best-effort: read aget_state and stash JSON-safe values/interrupts on
+    ``result`` for persistence. Never fails the run — a materialization error
+    just leaves the thread's previous state untouched."""
+    try:
+        config = create_thread_config(job.identity.thread_id, job.user)
+        snapshot = await graph.with_config(config).aget_state(config)
+        values, interrupts = _thread_state_service.materialize_state(snapshot)
+        if len(json.dumps(values, default=str)) > _MAX_MATERIALIZED_STATE_BYTES:
+            logger.warning("Skipping oversized thread state materialization", thread_id=job.identity.thread_id)
+            return
+        result.state_values = values
+        result.state_interrupts = interrupts
+        result.materialized = True
+    except Exception:
+        logger.warning(
+            "Thread state materialization failed (best-effort)",
+            run_id=job.identity.run_id,
+            thread_id=job.identity.thread_id,
+        )
 
 
 def _build_run_config(job: RunJob) -> dict[str, Any]:

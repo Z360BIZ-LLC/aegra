@@ -260,3 +260,54 @@ def history(verbose: bool) -> None:
     )
     if output.getvalue():
         console.print(output.getvalue().strip())
+
+
+@db.command("backfill-thread-state")
+@click.option("--limit", type=int, default=None, help="Cap the number of threads processed.")
+@click.option(
+    "--all",
+    "include_all",
+    is_flag=True,
+    help="Re-materialize every thread, not just those missing state.",
+)
+def backfill_thread_state_cmd(limit: int | None, include_all: bool) -> None:
+    """Backfill materialized thread state (values/interrupts) for existing threads.
+
+    Threads created before state materialization have empty search projections
+    until their next run. This computes aget_state for each thread and persists
+    the logical state. Run off-peak — it loads each thread's graph.
+
+    Example:
+
+        aegra db backfill-thread-state --limit 500
+    """
+    import asyncio
+
+    console.print(
+        Panel(
+            "[bold green]Backfilling materialized thread state[/bold green]",
+            title="[bold]Thread State Backfill[/bold]",
+            border_style="green",
+        )
+    )
+
+    from aegra_api.core.database import db_manager
+    from aegra_api.services.state_backfill import backfill_thread_state
+
+    async def _run() -> dict[str, int]:
+        await db_manager.initialize()
+        try:
+            return await backfill_thread_state(limit=limit, only_missing=not include_all)
+        finally:
+            await db_manager.close()
+
+    try:
+        stats = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Backfill failed:[/bold red] {exc}")
+        sys.exit(1)
+
+    console.print(
+        f"[green]Done.[/green] total={stats['total']} materialized={stats['materialized']} "
+        f"skipped_no_graph={stats['skipped_no_graph']} failed={stats['failed']}"
+    )

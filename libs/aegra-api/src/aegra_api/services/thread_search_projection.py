@@ -1,82 +1,66 @@
 """Projection of `select` / `extract` onto thread-search results.
 
-State values are not queryable JSONB — they are msgpack BYTEA in
-``checkpoint_blobs`` (see langgraph-checkpoint-postgres). So path extraction
-happens in Python after decode. The optimisation is in *what we read*: one
-batched query for the page's latest checkpoints, with the blob join pruned to
-only the channels the request references, and no checkpoint read at all when a
-request needs only metadata/base fields. Interrupts (SDK shape
-``{task_id: [Interrupt]}``) come from the latest checkpoint's ``__interrupt__``
-writes, fetched only when requested.
+Reads the **materialized** thread state — the `thread.values` / `thread.interrupts`
+columns populated from `aget_state` on run completion + state update. That is the
+graph's logical state, so it matches `GET /threads/{id}/state` for every agent,
+including middleware agents (e.g. deep_agent) whose messages live in
+`checkpoint_writes` and can't be reconstructed from raw checkpoint blobs without
+the graph.
+
+Because the state is real JSONB, `extract` paths are resolved **in Postgres** via
+`jsonb_path_query_first` — the DB returns only the referenced scalars/subtrees, not
+the whole state blob. The full column is fetched only when `select` asks for the
+entire `values`/`interrupts`. Nothing is read at all for metadata-only or
+base-field requests.
 """
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
-from psycopg.rows import dict_row
+from sqlalchemy import cast, func, select, type_coerce
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import UserDefinedType
 
-from aegra_api.core.database import db_manager
-from aegra_api.core.serializers import LangGraphSerializer
-from aegra_api.utils.json_path import extract_value, parse_path, top_level_channel
+from aegra_api.core.orm import Thread as ThreadORM
+from aegra_api.core.orm import _get_session_maker
+from aegra_api.utils.json_path import extract_value, parse_path
 
 logger = structlog.getLogger(__name__)
 
-# Latest root checkpoint per thread. State is reconstructed exactly like the
-# checkpointer (langgraph v4): inline `checkpoint.channel_values` overlaid with
-# the decoded blobs. The blob join is pruned to %(channels)s (NULL = all) so we
-# only transfer/decode the (often large) channels a request actually references.
-_LATEST_VALUES_SQL = """
-WITH latest AS (
-    SELECT DISTINCT ON (thread_id)
-           thread_id, checkpoint, checkpoint_ns, checkpoint_id
-    FROM checkpoints
-    WHERE checkpoint_ns = '' AND thread_id = ANY(%(ids)s::text[])
-    ORDER BY thread_id, checkpoint_id DESC
-)
-SELECT
-    l.thread_id AS thread_id,
-    l.checkpoint -> 'channel_values' AS inline_values,
-    (
-        SELECT array_agg(ARRAY[bl.channel::bytea, bl.type::bytea, bl.blob])
-        FROM jsonb_each_text(l.checkpoint -> 'channel_versions') AS cv(key, value)
-        JOIN checkpoint_blobs bl
-          ON bl.thread_id = l.thread_id
-         AND bl.checkpoint_ns = l.checkpoint_ns
-         AND bl.channel = cv.key
-         AND bl.version = cv.value
-        WHERE (%(channels)s::text[] IS NULL OR bl.channel = ANY(%(channels)s::text[]))
-    ) AS channel_values
-FROM latest l
-"""
 
-# Pending interrupts for each thread's latest checkpoint, grouped in Python into
-# the SDK shape {task_id: [Interrupt]}. Interrupts live in checkpoint_writes on
-# the reserved '__interrupt__' channel, not on the thread row.
-_INTERRUPTS_SQL = """
-WITH latest AS (
-    SELECT DISTINCT ON (thread_id)
-           thread_id, checkpoint_id, checkpoint_ns
-    FROM checkpoints
-    WHERE checkpoint_ns = '' AND thread_id = ANY(%(ids)s::text[])
-    ORDER BY thread_id, checkpoint_id DESC
-)
-SELECT cw.thread_id AS thread_id, cw.task_id AS task_id, cw.type AS type, cw.blob AS blob
-FROM latest l
-JOIN checkpoint_writes cw
-  ON cw.thread_id = l.thread_id
- AND cw.checkpoint_ns = l.checkpoint_ns
- AND cw.checkpoint_id = l.checkpoint_id
- AND cw.channel = '__interrupt__'
-ORDER BY cw.thread_id, cw.task_id, cw.idx
-"""
+class _JsonPath(UserDefinedType):
+    """Postgres ``jsonpath`` type so extract paths bind as CAST(:p AS jsonpath)."""
+
+    cache_ok = True
+
+    def get_col_spec(self, **_kw: Any) -> str:
+        return "JSONPATH"
+
+
+def _to_jsonpath(segments: Sequence[str | int]) -> str:
+    """Translate parsed path segments into a Postgres jsonpath string.
+
+    Keys are always quoted (so hyphenated task ids etc. are safe); negative
+    indices map to ``[last]`` / ``[last-N]``.
+    """
+    parts = ["$"]
+    for seg in segments:
+        if isinstance(seg, int):
+            if seg >= 0:
+                parts.append(f"[{seg}]")
+            elif seg == -1:
+                parts.append("[last]")
+            else:
+                parts.append(f"[last{seg + 1}]")
+        else:
+            escaped = seg.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'."{escaped}"')
+    return "".join(parts)
 
 
 class ThreadSearchProjectionService:
     """Builds projected result dicts for POST /threads/search."""
-
-    def __init__(self) -> None:
-        self.serializer = LangGraphSerializer()
 
     async def project(
         self,
@@ -87,115 +71,112 @@ class ThreadSearchProjectionService:
     ) -> list[dict[str, Any]]:
         """Project base thread dicts down to `select` and attach `extracted`.
 
-        ``base_dicts`` are already-serialized full thread rows (JSON-safe); this
-        keeps the service decoupled from the ORM/handler.
+        ``base_dicts`` are already-serialized full thread rows (JSON-safe), which
+        keeps this decoupled from the ORM/handler.
         """
         select_set = set(select) if select is not None else None
         parsed = {alias: parse_path(path) for alias, path in (extract or {}).items()}
-        value_paths = {alias: segs for alias, segs in parsed.items() if segs and segs[0] == "values"}
         wants_values = bool(select_set and "values" in select_set)
         wants_interrupts = bool(select_set and "interrupts" in select_set)
-        needs_interrupts = wants_interrupts or any(segs and segs[0] == "interrupts" for segs in parsed.values())
 
-        thread_ids = [base["thread_id"] for base in base_dicts]
-        decoded: dict[str, dict[str, Any]] = {}
-        if wants_values or value_paths:
-            channels = self._needed_channels(wants_values=wants_values, value_segments=value_paths.values())
-            decoded = await self._fetch_values(thread_ids, channels)
-        interrupts: dict[str, dict[str, Any]] = {}
-        if needs_interrupts:
-            interrupts = await self._fetch_interrupts(thread_ids)
+        # Paths resolved in SQL — only those whose full column isn't already fetched.
+        sql_value_paths = {} if wants_values else {a: s for a, s in parsed.items() if s and s[0] == "values"}
+        sql_interrupt_paths = (
+            {} if wants_interrupts else {a: s for a, s in parsed.items() if s and s[0] == "interrupts"}
+        )
+
+        data: dict[str, dict[str, Any]] = {}
+        if wants_values or wants_interrupts or sql_value_paths or sql_interrupt_paths:
+            thread_ids = [base["thread_id"] for base in base_dicts]
+            data = await self._fetch_projection(
+                thread_ids,
+                want_values=wants_values,
+                want_interrupts=wants_interrupts,
+                value_paths=sql_value_paths,
+                interrupt_paths=sql_interrupt_paths,
+            )
 
         results: list[dict[str, Any]] = []
         for base in base_dicts:
-            tid = base["thread_id"]
-            values = decoded.get(tid, {})
-            thread_interrupts = interrupts.get(tid, {})
+            row = data.get(base["thread_id"], {})
             out = dict(base)
             if wants_values:
-                out["values"] = values
+                out["values"] = row.get("values") or {}
             if wants_interrupts:
-                out["interrupts"] = thread_interrupts
+                out["interrupts"] = row.get("interrupts") or {}
             if select_set is not None:
                 out = {key: value for key, value in out.items() if key in select_set}
             if parsed:
-                sources = {
-                    "metadata": base.get("metadata") or {},
-                    "values": values,
-                    "interrupts": thread_interrupts,
-                }
-                out["extracted"] = {alias: self._extract_one(segs, sources) for alias, segs in parsed.items()}
+                out["extracted"] = self._assemble_extracted(
+                    parsed, base.get("metadata") or {}, row, wants_values, wants_interrupts
+                )
             results.append(out)
         return results
 
     @staticmethod
-    def _extract_one(segments: Sequence[str | int], sources: dict[str, Any]) -> Any:
-        root = segments[0]
-        source = sources.get(root) if isinstance(root, str) else None
-        if source is None:
-            return None
-        return extract_value(source, segments[1:])
+    def _assemble_extracted(
+        parsed: dict[str, list[str | int]],
+        metadata: dict[str, Any],
+        row: dict[str, Any],
+        wants_values: bool,
+        wants_interrupts: bool,
+    ) -> dict[str, Any]:
+        extracted: dict[str, Any] = {}
+        sql_extracted = row.get("extracted", {})
+        for alias, segments in parsed.items():
+            root = segments[0]
+            if root == "metadata":
+                extracted[alias] = extract_value(metadata, segments[1:])
+            elif root == "values" and wants_values:
+                extracted[alias] = extract_value(row.get("values") or {}, segments[1:])
+            elif root == "interrupts" and wants_interrupts:
+                extracted[alias] = extract_value(row.get("interrupts") or {}, segments[1:])
+            else:
+                extracted[alias] = sql_extracted.get(alias)
+        return extracted
 
-    @staticmethod
-    def _needed_channels(*, wants_values: bool, value_segments: Iterable[Sequence[str | int]]) -> list[str] | None:
-        """Channels to fetch: None = all (full `values` or a non-narrowable path)."""
-        if wants_values:
-            return None
-        channels: set[str] = set()
-        for segments in value_segments:
-            channel = top_level_channel(segments)
-            if channel is None:
-                return None
-            channels.add(channel)
-        return sorted(channels)
-
-    async def _fetch_values(self, thread_ids: list[str], channels: list[str] | None) -> dict[str, dict[str, Any]]:
-        """Batched, channel-pruned fetch of the latest state values per thread."""
+    async def _fetch_projection(
+        self,
+        thread_ids: list[str],
+        *,
+        want_values: bool,
+        want_interrupts: bool,
+        value_paths: dict[str, list[str | int]],
+        interrupt_paths: dict[str, list[str | int]],
+    ) -> dict[str, dict[str, Any]]:
+        """One batched query: full columns only when selected, plus per-path
+        jsonb_path_query_first for each extract path (DB returns just those)."""
         if not thread_ids:
             return {}
 
-        pool = db_manager.lg_pool
-        if pool is None:
-            raise RuntimeError("Database not initialized")
-        serde = db_manager.get_checkpointer().serde
+        columns: list[Any] = [ThreadORM.thread_id]
+        if want_values:
+            columns.append(ThreadORM.values_json)
+        if want_interrupts:
+            columns.append(ThreadORM.interrupts_json)
 
-        async with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(_LATEST_VALUES_SQL, {"ids": thread_ids, "channels": channels})
-            rows = await cur.fetchall()
+        labels: dict[str, str] = {}
+        for offset, (alias, segments) in enumerate(list(value_paths.items()) + list(interrupt_paths.items())):
+            source = ThreadORM.values_json if alias in value_paths else ThreadORM.interrupts_json
+            jsonpath = _to_jsonpath(segments[1:])
+            label = f"ext{offset}"
+            columns.append(
+                type_coerce(func.jsonb_path_query_first(source, cast(jsonpath, _JsonPath())), JSONB).label(label)
+            )
+            labels[label] = alias
 
-        return {row["thread_id"]: self._decode_row(row, serde) for row in rows}
-
-    def _decode_row(self, row: dict[str, Any], serde: Any) -> dict[str, Any]:
-        """Reconstruct one thread's state values, matching the checkpointer:
-        inline ``checkpoint.channel_values`` overlaid with the decoded blobs."""
-        blob_values = row["channel_values"] or []
-        blob_state = {
-            k.decode(): serde.loads_typed((t.decode(), v)) for k, t, v in blob_values if t.decode() != "empty"
-        }
-        channel_state = {**(row["inline_values"] or {}), **blob_state}
-        return self.serializer.serialize(channel_state)
-
-    async def _fetch_interrupts(self, thread_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Batched fetch of pending interrupts, grouped as {task_id: [Interrupt]}."""
-        if not thread_ids:
-            return {}
-
-        pool = db_manager.lg_pool
-        if pool is None:
-            raise RuntimeError("Database not initialized")
-        serde = db_manager.get_checkpointer().serde
-
-        async with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(_INTERRUPTS_SQL, {"ids": thread_ids})
-            rows = await cur.fetchall()
-
-        grouped: dict[str, dict[str, list[Any]]] = {}
-        for row in rows:
-            decoded = serde.loads_typed((row["type"], row["blob"]))
-            values = list(decoded) if isinstance(decoded, (list, tuple)) else [decoded]
-            per_thread = grouped.setdefault(row["thread_id"], {})
-            per_thread.setdefault(row["task_id"], []).extend(values)
-        return {tid: self.serializer.serialize(task_map) for tid, task_map in grouped.items()}
+        maker = _get_session_maker()
+        async with maker() as session:
+            result = await session.execute(select(*columns).where(ThreadORM.thread_id.in_(thread_ids)))
+            out: dict[str, dict[str, Any]] = {}
+            for row in result:
+                mapping = row._mapping
+                out[row.thread_id] = {
+                    "values": row.values_json if want_values else None,
+                    "interrupts": row.interrupts_json if want_interrupts else None,
+                    "extracted": {alias: mapping[label] for label, alias in labels.items()},
+                }
+            return out
 
 
 thread_search_projection = ThreadSearchProjectionService()
