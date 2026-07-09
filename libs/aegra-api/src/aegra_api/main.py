@@ -16,6 +16,7 @@ from fastapi.routing import APIRoute, APIRouter
 from aegra_api import __version__
 from aegra_api.api.assistants import router as assistants_router
 from aegra_api.api.crons import router as crons_router
+from aegra_api.api.event_streaming import router as event_streaming_router
 from aegra_api.api.runs import router as runs_router
 from aegra_api.api.stateless_runs import router as stateless_runs_router
 from aegra_api.api.store import router as store_router
@@ -52,6 +53,7 @@ OPENAPI_TAGS: list[dict[str, Any]] = [
     {"name": "Stateless Runs", "description": "Invoke a graph without state or memory persistence."},
     {"name": "Crons", "description": "Scheduled recurring runs on a cron schedule."},
     {"name": "Store", "description": "Persistent key-value and semantic storage available from any thread."},
+    {"name": "Event Streaming", "description": "Agent Protocol v2 thread event streaming and commands."},
     {"name": "Health", "description": "Server health checks and service information."},
 ]
 
@@ -376,6 +378,7 @@ def _include_core_routers(app: FastAPI) -> None:
     app.include_router(stateless_runs_router)
     app.include_router(crons_router)
     app.include_router(store_router)
+    app.include_router(event_streaming_router)
 
 
 def create_app() -> FastAPI:

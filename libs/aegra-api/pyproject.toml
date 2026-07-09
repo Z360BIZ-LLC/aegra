@@ -21,7 +21,7 @@ dependencies = [
     "fastapi>=0.110.1",
     "uvicorn>=0.35.0",
     "pydantic>=2.11.7",
-    "pydantic-settings>=2.12.0",
+    "pydantic-settings>=2.14.2",
     "sse-starlette>=3.3.4,<4.0.0",
 
     # LangGraph
@@ -43,7 +43,9 @@ dependencies = [
     "openinference-instrumentation-langchain>=0.1.58",
 
     # Metrics
-    "prometheus-fastapi-instrumentator>=7.1.0",
+    # >=8.0.2: 7.x reads route.path on FastAPI >=0.137's _IncludedRouter (which has
+    # no .path), 500ing every request when metrics are on. 8.0.2 handles the new tree.
+    "prometheus-fastapi-instrumentator>=8.0.2",
 
     # Utils
     "structlog>=25.4.0",
