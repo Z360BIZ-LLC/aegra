@@ -285,8 +285,27 @@ _PROMOTABLE_CANDIDATES_SQL = text(
 )
 
 
+# Runs with no tenant are exempt from limits, so they never appear above — but
+# the promoter replaces the reaper's stuck-pending sweep while enforcing, and
+# without this they would have no recovery path at all if their queue entry is
+# lost (Redis restart, or a crash between the run's commit and its enqueue).
+# Age-gated so freshly enqueued runs aren't pushed twice.
+_STUCK_UNSCOPED_CANDIDATES_SQL = text(
+    """
+    SELECT run_id
+      FROM runs
+     WHERE status = 'pending'
+       AND claimed_by IS NULL
+       AND org_id IS NULL
+       AND created_at < :stuck_before
+     ORDER BY created_at
+     LIMIT :scan_limit
+    """
+)
+
+
 async def find_promotable_runs(session: AsyncSession, *, batch_size: int) -> list[str]:
-    """Return queued run_ids whose org has a free slot, fairest-first.
+    """Return queued run_ids that are safe to dispatch, fairest-first.
 
     Purely advisory: the promoter re-enqueues these, and the claim re-checks
     capacity under the org lock, so an over-selection here is harmless.
@@ -307,7 +326,21 @@ async def find_promotable_runs(session: AsyncSession, *, batch_size: int) -> lis
         projected[org_id] = projected.get(org_id, 0) + 1
         promotable.append(run_id)
 
+    remaining = batch_size - len(promotable)
+    if remaining > 0:
+        promotable.extend(await _find_stuck_unscoped_runs(session, batch_size=remaining))
+
     return promotable
+
+
+async def _find_stuck_unscoped_runs(session: AsyncSession, *, batch_size: int) -> list[str]:
+    """Return long-pending runs that carry no tenant and so are never gated."""
+    stuck_before = datetime.now(UTC) - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS)
+    result = await session.execute(
+        _STUCK_UNSCOPED_CANDIDATES_SQL,
+        {"stuck_before": stuck_before, "scan_limit": batch_size},
+    )
+    return [row[0] for row in result.all()]
 
 
 async def find_expired_queued_runs(session: AsyncSession, *, batch_size: int) -> list[RunORM]:

@@ -167,8 +167,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Start executor (spawns worker coroutines when Redis is enabled)
     await executor.start()
 
-    # Start lease reaper (recovers crashed worker runs, Redis mode only)
-    if settings.redis.REDIS_BROKER_ENABLED:
+    # Start lease reaper (recovers runs whose owner died). Also required in dev
+    # mode when run limits are on: an unrecovered 'running' row holds its org's
+    # capacity, which would wedge the tenant rather than just losing one run.
+    if settings.redis.REDIS_BROKER_ENABLED or settings.run_limits.enforcing:
         await lease_reaper.start()
 
     # Start cron scheduler (fires due cron jobs)
@@ -218,7 +220,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await run_promoter.stop()
     if settings.cron.CRON_ENABLED:
         await cron_scheduler.stop()
-    if settings.redis.REDIS_BROKER_ENABLED:
+    if settings.redis.REDIS_BROKER_ENABLED or settings.run_limits.enforcing:
         await lease_reaper.stop()
     await executor.stop()
     await broker_manager.stop()

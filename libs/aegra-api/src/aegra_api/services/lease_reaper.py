@@ -151,6 +151,11 @@ class LeaseReaper:
     @staticmethod
     async def _reenqueue(run_ids: list[str]) -> None:
         queue_key = settings.worker.WORKER_QUEUE_KEY
+        if not settings.redis.REDIS_BROKER_ENABLED:
+            # Dev mode has no job queue; the rows are back to pending and the
+            # run promoter dispatches them on its next pass.
+            logger.info("Reset runs to pending for the promoter to dispatch", run_ids=run_ids)
+            return
         try:
             client = redis_manager.get_client()
             for run_id in run_ids:

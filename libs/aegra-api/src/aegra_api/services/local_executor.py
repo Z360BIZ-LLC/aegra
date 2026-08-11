@@ -6,6 +6,9 @@ as background coroutines in the same event loop as the API server.
 
 import asyncio
 import contextlib
+import os
+import socket
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import select
@@ -17,6 +20,11 @@ from aegra_api.models.run_job import RunJob
 from aegra_api.observability.span_enrichment import make_run_trace_context
 from aegra_api.services import run_limits
 from aegra_api.services.base_executor import BaseExecutor
+
+# Lease bookkeeping is identical for both executors; sharing it keeps a local
+# run's liveness signal in the same shape the reaper and the run-limit count
+# already understand.
+from aegra_api.services.worker_executor import _heartbeat_loop, _release_lease
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -24,6 +32,10 @@ logger = structlog.getLogger(__name__)
 
 class LocalExecutor(BaseExecutor):
     """Runs graphs as local asyncio tasks (single-instance dev mode)."""
+
+    def __init__(self) -> None:
+        self._owner = f"local-{socket.gethostname()}-{os.getpid()}"
+        self._lease_tasks: set[asyncio.Task[None]] = set()
 
     async def submit(self, job: RunJob) -> None:
         # With limits off the run starts immediately and execute_run performs
@@ -65,18 +77,43 @@ class LocalExecutor(BaseExecutor):
         )
         task = asyncio.create_task(execute_run(job), context=trace_ctx)
         active_runs[job.identity.run_id] = task
+        if settings.run_limits.enforcing:
+            keeper = asyncio.create_task(self._keep_lease(job.identity.run_id, task))
+            self._lease_tasks.add(keeper)
+            keeper.add_done_callback(self._lease_tasks.discard)
         logger.info(
             "Submitted run to local executor",
             run_id=job.identity.run_id,
             task_id=id(task),
         )
 
-    @staticmethod
-    async def _claim(run_id: str) -> bool:
+    async def _keep_lease(self, run_id: str, job_task: asyncio.Task[None]) -> None:
+        """Hold the run's lease alive until it finishes, then release it.
+
+        Without a heartbeat, a run killed by a restart stays ``running`` with
+        no expiry — indistinguishable from a live run, so it would occupy its
+        org's capacity forever and wedge the whole tenant.
+        """
+        heartbeat = asyncio.create_task(_heartbeat_loop(run_id, self._owner, job_task=job_task))
+        try:
+            await asyncio.wait({job_task})
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+            await _release_lease(run_id, self._owner)
+
+    async def _claim(self, run_id: str) -> bool:
         """Reserve a capacity slot for this run, committing the transition."""
+        lease_until = datetime.now(UTC) + timedelta(seconds=settings.worker.LEASE_DURATION_SECONDS)
         maker = _get_session_maker()
         async with maker() as session:
-            outcome = await run_limits.try_start_run(session, run_id)
+            outcome = await run_limits.try_start_run(
+                session,
+                run_id,
+                claimed_by=self._owner,
+                lease_expires_at=lease_until,
+            )
             if outcome is not run_limits.ClaimOutcome.CLAIMED:
                 await session.rollback()
                 return False

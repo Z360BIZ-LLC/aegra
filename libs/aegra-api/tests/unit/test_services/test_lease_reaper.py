@@ -130,6 +130,18 @@ class TestReenqueue:
             await LeaseReaper._reenqueue(["run-1"])
 
     @pytest.mark.asyncio
+    async def test_skips_redis_when_broker_is_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Dev mode has no job queue; the promoter dispatches the reset rows."""
+        monkeypatch.setattr(settings.redis, "REDIS_BROKER_ENABLED", False)
+        mock_redis = AsyncMock()
+
+        with patch("aegra_api.services.lease_reaper.redis_manager") as manager:
+            manager.get_client.return_value = mock_redis
+            await LeaseReaper._reenqueue(["run-1"])
+
+        mock_redis.rpush.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_noop_when_empty_list(self) -> None:
         mock_client = AsyncMock()
 

@@ -164,6 +164,7 @@ class TestFindPromotableRuns:
             execute=[
                 _result(rows=[("full-org", 2), ("free-org", 1)]),
                 _result(rows=[("run-full", "full-org"), ("run-free", "free-org")]),
+                _result(rows=[]),
             ]
         )
 
@@ -175,6 +176,7 @@ class TestFindPromotableRuns:
             execute=[
                 _result(rows=[]),
                 _result(rows=[("run-1", ORG), ("run-2", ORG), ("run-3", ORG)]),
+                _result(rows=[]),
             ]
         )
 
@@ -192,9 +194,32 @@ class TestFindPromotableRuns:
         assert await find_promotable_runs(session, batch_size=2) == ["run-1", "run-2"]
 
     async def test_returns_empty_when_nothing_is_queued(self, limits: None) -> None:
-        session = _session(execute=[_result(rows=[]), _result(rows=[])])
+        session = _session(execute=[_result(rows=[]), _result(rows=[]), _result(rows=[])])
 
         assert await find_promotable_runs(session, batch_size=10) == []
+
+    async def test_recovers_long_pending_runs_that_have_no_org(self, limits: None) -> None:
+        """Exempt runs are never gated, so the promoter is their only safety net."""
+        session = _session(
+            execute=[
+                _result(rows=[]),
+                _result(rows=[]),
+                _result(rows=[("run-orphan",)]),
+            ]
+        )
+
+        assert await find_promotable_runs(session, batch_size=10) == ["run-orphan"]
+
+    async def test_org_less_recovery_does_not_exceed_batch_size(self, limits: None) -> None:
+        """A full batch of org-scoped runs leaves no room for the orphan sweep."""
+        session = _session(
+            execute=[
+                _result(rows=[]),
+                _result(rows=[("run-1", ORG), ("run-2", ORG)]),
+            ]
+        )
+
+        assert await find_promotable_runs(session, batch_size=2) == ["run-1", "run-2"]
 
 
 class TestStaleRunsAreNotCounted:
