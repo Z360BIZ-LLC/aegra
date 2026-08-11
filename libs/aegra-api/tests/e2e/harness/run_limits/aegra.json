@@ -1,5 +1,6 @@
 {
   "graphs": {
-    "sleeper": "./sleep_graph.py:graph"
+    "sleeper": "./sleep_graph.py:graph",
+    "interrupter": "./interrupt_graph.py:graph"
   }
 }
