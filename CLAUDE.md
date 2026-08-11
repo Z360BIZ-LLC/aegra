@@ -99,6 +99,7 @@ def create_user(name: str, age: int) -> User: ...
 def process(items: list[str]) -> None: ...
 async def fetch(url: str) -> dict[str, Any]: ...
 
+
 # WRONG — missing return type, missing param types
 def create_user(name, age): ...
 def process(items): ...
@@ -140,6 +141,7 @@ def get_user(user_id: str) -> User:
     except UserNotFoundError:
         raise HTTPException(status_code=404, detail="User not found")
 
+
 # WRONG — broad catch, swallowed exception, happy path buried
 def get_user(user_id):
     try:
@@ -160,13 +162,15 @@ def get_user(user_id):
 
 ```python
 # CORRECT — keyword-only args, immutable default
-def create_assistant(name: str, *, graph_id: str, config: dict | None = None, metadata: dict | None = None) -> Assistant:
+def create_assistant(
+    name: str, *, graph_id: str, config: dict | None = None, metadata: dict | None = None
+) -> Assistant:
     config = config or {}
     ...
 
+
 # WRONG — mutable default, too many positional args
-def create_assistant(name, graph_id, config={}, metadata={}, version=1, context={}):
-    ...
+def create_assistant(name, graph_id, config={}, metadata={}, version=1, context={}): ...
 ```
 
 ### Testing (STRICT)
@@ -277,6 +281,7 @@ graph = builder.compile()  # Must export as 'graph'
 **Factory function** (called per-request with user/config context):
 ```python
 from langgraph_sdk.runtime import ServerRuntime
+
 
 def graph(runtime: ServerRuntime):
     """Per-request factory — receives user, store, and access context."""
