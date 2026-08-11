@@ -35,7 +35,6 @@ services:
       - DEBUG=true
       - PORT=${PORT:-8000}
       - UV_CACHE_DIR=/tmp/uv-cache
-      - API_BASE_URL=http://mock:8003 # Points to mock API
       - REDIS_BROKER_ENABLED=true
       - REDIS_URL=redis://redis:6379/0
       - WORKER_COUNT=3
@@ -63,6 +62,8 @@ services:
       - ../src/evaluator_agent:/app/src/evaluator_agent:ro
       - ../src/ability_testing_agent:/app/src/ability_testing_agent:ro
       - ../src/session_name_agent:/app/src/session_name_agent:ro
+      # deep_agent is referenced by aegra.json — mount it so the graph loads
+      - ../src/deep_agent:/app/src/deep_agent:ro
       # Mount packages/common for hot reload
       - ../../../packages/common:/app/packages/common:ro
     command: >
@@ -73,44 +74,14 @@ services:
         uvicorn aegra_api.main:app --host 0.0.0.0 --port $${PORT:-8000} --reload
       "
 
-  # Webhook receiver for testing
-  webhook-receiver:
-    build:
-      context: .
-      dockerfile: Dockerfile.webhook
-    ports:
-      - "8002:8002"
-    volumes:
-      - ./test_webhook_receiver.py:/app/test_webhook_receiver.py:ro
-      - ./webhook_logs:/app/webhook_logs
-
-  # Mock API server
-  mock:
-    build:
-      context: ../../..
-      dockerfile: dev/mock/Dockerfile
-    env_file:
-      - ../../../.env
-    ports:
-      - "${MOCK_PORT:-8003}:8003"
-    volumes:
-      # Mount database files for easy editing during development
-      - ../../../dev/database:/app/dev/database
-      # Mount webhook data directory for easy access to saved webhook files
-      - ../../../dev/webhook_data:/app/webhook_data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8003/check-status"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-    restart: unless-stopped
-
   # Redis - enables multi-instance SSE streaming with pub/sub + replay
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # Host port 6377 to avoid clashing with the Z360 app-side stack's Redis
+      # (6379). Container port stays 6379 so "redis://redis:6379" is unchanged.
+      - "6377:6379"
     volumes:
       - redis_data:/data
     healthcheck:

@@ -1,17 +1,220 @@
-# Dev mode override — disables Redis, uses in-process executor.
-# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# Full local dev/test stack — one command brings up everything needed to
+# exercise the text AND voice agents locally.
 #
-# This runs Aegra with LocalExecutor (asyncio.create_task) and
-# in-memory broker — same as `aegra dev` but inside Docker.
+# Base (docker-compose.yml) provides the "real" infra: postgres, redis, aegra.
+# This overlay adds the dev-only pieces: mock API, webhook receiver, MinIO (S3),
+# gateway (+ ARQ worker), and the voice agent. It also flips aegra to the
+# in-process LocalExecutor (no Redis broker) and repoints every service at the
+# docker-internal mock / MinIO / aegra hostnames.
+#
+# Usage (from agent-layer root):
+#   make dev-up      # build + start the whole stack
+#   make dev-logs    # tail logs
+#   make dev-down    # stop (volumes kept)
+#
+# Or directly:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 
 services:
+  # --- aegra: dev mode (LocalExecutor) + local mock/MinIO wiring ---
   aegra:
     environment:
       - REDIS_BROKER_ENABLED=false
+      - API_BASE_URL=http://mock:8003
+      - POSTGRES=postgresql://user:password@postgres:5432/aegra
+      # deep_agent (served via aegra.json) uses the local MinIO for
+      # skills/memory/artifacts. Endpoint + creds override the host-based
+      # values coming from .env.
+      - AGENT_S3_ENDPOINT=http://minio:9000
+      - AGENT_S3_BUCKET=${AGENT_S3_BUCKET:-agent-layer-dev}
+      - AGENT_S3_REGION=${AGENT_S3_REGION:-us-east-1}
+      - AGENT_S3_ACCESS_KEY=${AGENT_S3_ACCESS_KEY:-minioadmin}
+      - AGENT_S3_SECRET_KEY=${AGENT_S3_SECRET_KEY:-minioadmin}
     depends_on:
       postgres:
         condition: service_healthy
+      mock:
+        condition: service_healthy
+      minio-createbucket:
+        condition: service_completed_successfully
 
-  # Keep Redis running but Aegra won't use it (REDIS_BROKER_ENABLED=false).
-  # This avoids compose dependency issues while still allowing the same
-  # docker-compose.yml base.
+  # --- Mock application API (dev-only) ---
+  mock:
+    build:
+      context: ../../..
+      dockerfile: dev/mock/Dockerfile
+    env_file:
+      - ../../../.env
+    environment:
+      - POSTGRES=postgresql://user:password@postgres:5432/aegra
+    ports:
+      - "${MOCK_PORT:-8003}:8003"
+    volumes:
+      # Mount database + webhook files for easy editing during development
+      - ../../../dev/database:/app/dev/database
+      - ../../../dev/webhook_data:/app/webhook_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/check-status"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # --- Webhook receiver for testing agent callbacks (dev-only) ---
+  webhook-receiver:
+    build:
+      context: .
+      dockerfile: Dockerfile.webhook
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./test_webhook_receiver.py:/app/test_webhook_receiver.py:ro
+      - ./webhook_logs:/app/webhook_logs
+    restart: unless-stopped
+
+  # --- Local S3 (MinIO) for DeepAgent resources (attachments/skills/artifacts) ---
+  # Ports 9010/9011 on the host to avoid clashing with the Z360 app's local
+  # MinIO (9000/9001). Container port stays 9000 so "minio:9000" is unchanged.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${AGENT_S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${AGENT_S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "${MINIO_PORT:-9010}:9000"
+      - "${MINIO_CONSOLE_PORT:-9011}:9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  # One-shot: wait for MinIO, then create the dev bucket (idempotent).
+  minio-createbucket:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      - AGENT_S3_ACCESS_KEY=${AGENT_S3_ACCESS_KEY:-minioadmin}
+      - AGENT_S3_SECRET_KEY=${AGENT_S3_SECRET_KEY:-minioadmin}
+      - AGENT_S3_BUCKET=${AGENT_S3_BUCKET:-agent-layer-dev}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 \"$$AGENT_S3_ACCESS_KEY\" \"$$AGENT_S3_SECRET_KEY\"; do echo 'waiting for minio...'; sleep 1; done;
+      mc mb --ignore-existing local/\"$$AGENT_S3_BUCKET\";
+      echo 'minio bucket ready: '\"$$AGENT_S3_BUCKET\";
+      "
+
+  # --- Gateway (FastAPI) — dev target with hot reload ---
+  gateway:
+    build:
+      context: ../../..
+      dockerfile: gateway/Dockerfile
+      target: development
+    env_file:
+      - ../../../.env
+    environment:
+      - HOST_URL=http://host.docker.internal
+      - ENTRYPOINT_MODE=development
+      - WWWUSER=${HOST_UID:-1000}
+      - WWWGROUP=${HOST_GID:-1000}
+      - API_BASE_URL=http://mock:8003
+      - LANGGRAPH_URL=http://aegra:8000
+      - POSTGRES=postgresql://user:password@postgres:5432/aegra
+      - REDIS_URL=redis://redis:6379/0
+      - AGENT_S3_ENDPOINT=http://minio:9000
+      - AGENT_S3_BUCKET=${AGENT_S3_BUCKET:-agent-layer-dev}
+      - AGENT_S3_REGION=${AGENT_S3_REGION:-us-east-1}
+      - AGENT_S3_ACCESS_KEY=${AGENT_S3_ACCESS_KEY:-minioadmin}
+      - AGENT_S3_SECRET_KEY=${AGENT_S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "${GATEWAY_PORT:-8081}:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../../../gateway/src:/app/src
+      - ../../../packages/common:/app/packages/common
+      - ../../../gateway/pyproject.toml:/app/pyproject.toml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      aegra:
+        condition: service_healthy
+      mock:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-createbucket:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ARQ worker for the gateway (background jobs: titles, deep_agent enqueue).
+  # Same image + source mounts as gateway, different command (no HTTP port).
+  gateway-worker:
+    build:
+      context: ../../..
+      dockerfile: gateway/Dockerfile
+      target: development
+    env_file:
+      - ../../../.env
+    environment:
+      - HOST_URL=http://host.docker.internal
+      - ENTRYPOINT_MODE=development
+      - WWWUSER=${HOST_UID:-1000}
+      - WWWGROUP=${HOST_GID:-1000}
+      - API_BASE_URL=http://mock:8003
+      - LANGGRAPH_URL=http://aegra:8000
+      - POSTGRES=postgresql://user:password@postgres:5432/aegra
+      - REDIS_URL=redis://redis:6379/0
+      - AGENT_S3_ENDPOINT=http://minio:9000
+      - AGENT_S3_BUCKET=${AGENT_S3_BUCKET:-agent-layer-dev}
+      - AGENT_S3_REGION=${AGENT_S3_REGION:-us-east-1}
+      - AGENT_S3_ACCESS_KEY=${AGENT_S3_ACCESS_KEY:-minioadmin}
+      - AGENT_S3_SECRET_KEY=${AGENT_S3_SECRET_KEY:-minioadmin}
+    command: ["uv", "run", "arq", "src.worker.settings.WorkerSettings"]
+    volumes:
+      - ../../../gateway/src:/app/src
+      - ../../../packages/common:/app/packages/common
+      - ../../../gateway/pyproject.toml:/app/pyproject.toml
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Voice agent (LiveKit) — built from the root Dockerfile ---
+  # Connects out to LiveKit Cloud (LIVEKIT_URL/keys from .env). Talks to the
+  # local aegra (deep_agent), mock API, and MinIO.
+  voice:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    env_file:
+      - ../../../.env
+    environment:
+      # Langfuse + LiveKit creds come straight from .env (LANGFUSE_*, LIVEKIT_*).
+      - API_BASE_URL=http://mock:8003
+      - LANGGRAPH_URL=http://aegra:8000
+      - POSTGRES=postgresql://user:password@postgres:5432/aegra
+      - AGENT_S3_ENDPOINT=http://minio:9000
+      - AGENT_S3_BUCKET=${AGENT_S3_BUCKET:-agent-layer-dev}
+      - AGENT_S3_REGION=${AGENT_S3_REGION:-us-east-1}
+      - AGENT_S3_ACCESS_KEY=${AGENT_S3_ACCESS_KEY:-minioadmin}
+      - AGENT_S3_SECRET_KEY=${AGENT_S3_SECRET_KEY:-minioadmin}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Mount source for quick edits (restart voice to pick up changes)
+      - ../../../agents/voice/src:/app/src
+      - ../../../packages/common:/app/packages/common
+    depends_on:
+      aegra:
+        condition: service_healthy
+      mock:
+        condition: service_healthy
+      minio-createbucket:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  minio_data:
