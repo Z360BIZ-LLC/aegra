@@ -21,12 +21,10 @@ import contextlib
 import structlog
 from observability.cloudwatch_emf import emit_metric
 
-from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
-from aegra_api.models.run_job import RunJob
 from aegra_api.services import run_limits
 from aegra_api.services.executor import executor
-from aegra_api.services.run_status import finalize_run
+from aegra_api.services.run_status import set_thread_status
 from aegra_api.services.webhook_service import send_run_webhook
 from aegra_api.settings import settings
 
@@ -73,9 +71,13 @@ class RunPromoter:
                 logger.exception("Error in run promoter")
 
     async def tick(self) -> None:
-        """Run one promotion pass followed by one expiry pass."""
-        await self._promote_ready()
+        """Expire overdue runs, then dispatch what capacity allows.
+
+        Expiry runs first so a doomed run is not dispatched microseconds
+        before being killed.
+        """
         await self._expire_overdue()
+        await self._promote_ready()
 
     @staticmethod
     async def _promote_ready() -> None:
@@ -110,58 +112,51 @@ class RunPromoter:
                 batch_size=settings.run_limits.ORG_RUN_PROMOTER_BATCH_SIZE,
             )
 
-        for run_orm in overdue:
-            await self._expire_run(run_orm)
+        for expired in overdue:
+            await self._expire_run(expired)
 
     @staticmethod
-    async def _expire_run(run_orm: RunORM) -> None:
-        """Mark one overdue run as failed and notify its webhook."""
+    async def _expire_run(expired: run_limits.ExpiredRun) -> None:
+        """Fail one overdue run, but only if it is still queued.
+
+        The conditional claim is what makes this safe to run on every pod and
+        alongside promotion: whoever wins the row owns the notification.
+        """
+        maker = _get_session_maker()
+        async with maker() as session:
+            won = await run_limits.claim_expired_run(session, expired.run_id, error=_QUEUE_EXPIRY_ERROR)
+            if not won:
+                await session.rollback()
+                logger.debug("Overdue run already started or expired elsewhere", run_id=expired.run_id)
+                return
+            await set_thread_status(session, expired.thread_id, "error")
+            await session.commit()
+
         logger.warning(
-            "Expiring run that exceeded the maximum queue wait",
-            run_id=run_orm.run_id,
-            org_id=run_orm.org_id,
-            created_at=run_orm.created_at.isoformat(),
-        )
-        await finalize_run(
-            run_orm.run_id,
-            run_orm.thread_id,
-            status="error",
-            thread_status="error",
-            output={},
-            error=_QUEUE_EXPIRY_ERROR,
+            "Expired run that exceeded the maximum queue wait",
+            run_id=expired.run_id,
+            org_id=expired.org_id,
         )
         emit_metric(
             "OrgRunQueueExpired",
             1,
             properties={
-                "run_id": run_orm.run_id,
-                "thread_id": run_orm.thread_id,
-                "org_id": run_orm.org_id,
+                "run_id": expired.run_id,
+                "thread_id": expired.thread_id,
+                "org_id": expired.org_id,
             },
         )
 
-        webhook_url = _webhook_url_for(run_orm)
-        if webhook_url is None:
+        if expired.webhook_url is None:
             return
         await send_run_webhook(
-            webhook_url=webhook_url,
-            run_id=run_orm.run_id,
-            thread_id=run_orm.thread_id,
+            webhook_url=expired.webhook_url,
+            run_id=expired.run_id,
+            thread_id=expired.thread_id,
             status="error",
             output={},
             error_message=_QUEUE_EXPIRY_ERROR,
         )
-
-
-def _webhook_url_for(run_orm: RunORM) -> str | None:
-    """Read the caller's webhook URL out of the persisted execution params."""
-    if run_orm.execution_params is None:
-        return None
-    try:
-        return RunJob.from_run_orm(run_orm).behavior.webhook_url
-    except (KeyError, ValueError):
-        logger.warning("Cannot read webhook URL for expired run", run_id=run_orm.run_id)
-        return None
 
 
 run_promoter = RunPromoter()

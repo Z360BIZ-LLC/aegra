@@ -20,7 +20,7 @@ import structlog
 from asgi_correlation_id import correlation_id
 from redis import RedisError
 from redis import TimeoutError as RedisTimeoutError
-from sqlalchemy import select, update
+from sqlalchemy import Select, select, update
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.orm import Run as RunORM
@@ -332,20 +332,27 @@ class WorkerExecutor(BaseExecutor):
         async with maker() as session:
             if settings.run_limits.enforcing:
                 promotable = await run_limits.find_promotable_runs(session, batch_size=1)
-                return promotable[0] if promotable else None
+                if promotable:
+                    return promotable[0]
+                # Runs with no tenant are never gated, so pick them up
+                # immediately rather than waiting out the promoter's
+                # stuck-run threshold on this already-degraded path.
+                return await session.scalar(_oldest_pending_stmt(unscoped_only=True))
 
-            run_id = await session.scalar(
-                select(RunORM.run_id)
-                .where(RunORM.status == "pending", RunORM.claimed_by.is_(None))
-                .order_by(RunORM.created_at.asc())
-                .limit(1)
-            )
-            return run_id
+            return await session.scalar(_oldest_pending_stmt(unscoped_only=False))
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+
+def _oldest_pending_stmt(*, unscoped_only: bool) -> Select[tuple[str]]:
+    """Select the oldest unclaimed pending run, optionally only tenant-less ones."""
+    stmt = select(RunORM.run_id).where(RunORM.status == "pending", RunORM.claimed_by.is_(None))
+    if unscoped_only:
+        stmt = stmt.where(RunORM.org_id.is_(None))
+    return stmt.order_by(RunORM.created_at.asc()).limit(1)
 
 
 async def _get_thread_id_for_run(run_id: str) -> str | None:

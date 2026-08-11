@@ -26,8 +26,9 @@ from typing import Any
 
 import structlog
 from observability.cloudwatch_emf import emit_metric
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.settings import settings
@@ -108,13 +109,25 @@ def max_limit() -> int:
     return max(settings.run_limits.ORG_MAX_CONCURRENT_RUNS, *overrides.values())
 
 
-def _stale_run_cutoff() -> datetime:
-    """Runs created before this can no longer legitimately be executing.
+def _live_run_clause() -> ColumnElement[bool]:
+    """Match ``running`` rows whose owner is still demonstrably alive.
 
-    Anything older is a wedged row; excluding it stops one stuck run from
-    permanently holding a slot the reaper hasn't gotten to yet.
+    The lease is the liveness signal: both executors heartbeat it, so a run
+    killed by a restart stops counting once its lease lapses.
+
+    Age is only a fallback for rows with no lease at all (written before this
+    feature, or while limits were off). It must NOT apply to leased rows:
+    ``created_at`` is queue-entry time, while ``BG_JOB_TIMEOUT_SECS`` bounds
+    execution from the *claim*, so a run that waited out a long queue would go
+    invisible the instant it started — dissolving the ceiling exactly when the
+    org is busiest.
     """
-    return datetime.now(UTC) - timedelta(seconds=settings.worker.BG_JOB_TIMEOUT_SECS)
+    now = datetime.now(UTC)
+    no_lease_but_recent = and_(
+        RunORM.lease_expires_at.is_(None),
+        RunORM.created_at > now - timedelta(seconds=settings.worker.BG_JOB_TIMEOUT_SECS),
+    )
+    return or_(RunORM.lease_expires_at > now, no_lease_but_recent)
 
 
 async def lock_org(session: AsyncSession, org_id: str) -> None:
@@ -123,6 +136,10 @@ async def lock_org(session: AsyncSession, org_id: str) -> None:
     Without it the capacity count is a phantom read: two workers can both
     observe ``limit - 1`` active runs and both start one. The lock releases on
     commit or rollback, and serializes only run *admission* for a single org.
+
+    ``hashtext`` collisions can occasionally make two different orgs share a
+    lock. That costs a little admission throughput and nothing else — the
+    count each one then takes is still its own.
     """
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:namespace, hashtext(:org_id))"),
@@ -137,15 +154,13 @@ async def count_active_runs(session: AsyncSession, org_id: str) -> int:
     deadlock an org against its own backlog. Rows whose worker lease has
     expired are excluded — the worker is gone and the reaper will reset them.
     """
-    now = datetime.now(UTC)
     stmt = (
         select(func.count())
         .select_from(RunORM)
         .where(
             RunORM.org_id == org_id,
             RunORM.status == "running",
-            or_(RunORM.lease_expires_at.is_(None), RunORM.lease_expires_at > now),
-            RunORM.created_at > _stale_run_cutoff(),
+            _live_run_clause(),
         )
     )
     return await session.scalar(stmt) or 0
@@ -248,14 +263,12 @@ async def _apply_capacity_gate(session: AsyncSession, run_id: str) -> ClaimOutco
 
 async def active_counts_by_org(session: AsyncSession) -> dict[str, int]:
     """Return per-org active run counts in one pass, for the promoter."""
-    now = datetime.now(UTC)
     stmt = (
         select(RunORM.org_id, func.count())
         .where(
             RunORM.org_id.isnot(None),
             RunORM.status == "running",
-            or_(RunORM.lease_expires_at.is_(None), RunORM.lease_expires_at > now),
-            RunORM.created_at > _stale_run_cutoff(),
+            _live_run_clause(),
         )
         .group_by(RunORM.org_id)
     )
@@ -343,22 +356,79 @@ async def _find_stuck_unscoped_runs(session: AsyncSession, *, batch_size: int) -
     return [row[0] for row in result.all()]
 
 
-async def find_expired_queued_runs(session: AsyncSession, *, batch_size: int) -> list[RunORM]:
+@dataclass(frozen=True, slots=True)
+class ExpiredRun:
+    """A queued run that waited too long, detached from its session.
+
+    Plain values rather than a live ORM row: the promoter acts on these after
+    the reading session has closed, and a lazily-loaded attribute would raise
+    ``DetachedInstanceError`` the moment someone defers a column.
+    """
+
+    run_id: str
+    thread_id: str
+    org_id: str | None
+    webhook_url: str | None
+
+
+async def find_expired_queued_runs(session: AsyncSession, *, batch_size: int) -> list[ExpiredRun]:
     """Return runs that have waited in the queue past the maximum wait.
 
     A run that starts hours late would answer a conversation that has long
     since moved on, so these are failed rather than eventually executed.
+
+    Scoped to tenant runs: only they can be held by the ceiling, and expiring
+    an exempt run would be an unrelated global "pending too long" policy
+    reported under a limit that never applied to it.
     """
     cutoff = datetime.now(UTC) - timedelta(seconds=settings.run_limits.ORG_RUN_MAX_QUEUE_WAIT_SECONDS)
     stmt = (
-        select(RunORM)
+        select(RunORM.run_id, RunORM.thread_id, RunORM.org_id, RunORM.execution_params)
         .where(
             RunORM.status == "pending",
             RunORM.claimed_by.is_(None),
+            RunORM.org_id.isnot(None),
             RunORM.created_at < cutoff,
         )
         .order_by(RunORM.created_at.asc())
         .limit(batch_size)
     )
-    result = await session.scalars(stmt)
-    return list(result.all())
+    result = await session.execute(stmt)
+    return [
+        ExpiredRun(
+            run_id=run_id,
+            thread_id=thread_id,
+            org_id=org_id,
+            webhook_url=_webhook_url_from(execution_params),
+        )
+        for run_id, thread_id, org_id, execution_params in result.all()
+    ]
+
+
+def _webhook_url_from(execution_params: dict[str, Any] | None) -> str | None:
+    """Read the caller's webhook URL out of persisted execution params."""
+    behavior = (execution_params or {}).get("behavior")
+    if not isinstance(behavior, Mapping):
+        return None
+    url = behavior.get("webhook_url")
+    return url if isinstance(url, str) and url else None
+
+
+async def claim_expired_run(session: AsyncSession, run_id: str, *, error: str) -> bool:
+    """Mark one overdue run as failed, returning False if it is no longer ours.
+
+    Conditional on the run still being queued, which closes two holes: a run a
+    worker claimed since the scan must not be flipped to ``error`` while it
+    executes, and with a promoter on every pod only one may win the row and
+    send the webhook.
+    """
+    result = await session.execute(
+        update(RunORM)
+        .where(
+            RunORM.run_id == run_id,
+            RunORM.status == "pending",
+            RunORM.claimed_by.is_(None),
+        )
+        .values(status="error", error_message=error, updated_at=datetime.now(UTC))
+    )
+    return bool(result.rowcount)  # type: ignore[union-attr]

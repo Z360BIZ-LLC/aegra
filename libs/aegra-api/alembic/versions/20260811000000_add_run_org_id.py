@@ -1,8 +1,14 @@
 """Add runs.org_id for per-organization concurrency limits
 
-Adds the tenant key the run-limit policy counts on, backfills it from the
-run config the callers already send (``config.configurable.org_id``), and
-creates a partial index covering only active runs.
+Adds the tenant key the run-limit policy counts on, backfills it for runs
+that are still active, and creates a partial index covering only those.
+
+The backfill is deliberately scoped to ``pending``/``running`` rows. Alembic
+wraps the whole migration in one transaction, so a full-history backfill would
+hold a row lock on every run ever created until the migration commits — on a
+large table that stalls live runs updating their own status, during startup.
+Only active rows are ever read by the policy, so historical rows gain nothing
+from being populated; backfill them out-of-band if they are ever wanted.
 
 The index is built CONCURRENTLY inside an ``autocommit_block``: the
 transactional build takes a SHARE lock on ``runs`` for its duration, which
@@ -28,32 +34,24 @@ depends_on = None
 
 
 INDEX_NAME = "idx_runs_org_active"
-# Bound each backfill statement so a large runs table can't hold a single
-# long-running UPDATE against production writes.
-BACKFILL_BATCH_SIZE = 5000
+
+# Mirrors resolve_org_id: config wins, run metadata is the fallback.
+BACKFILL_ACTIVE_RUNS = sa.text(
+    """
+    UPDATE runs
+       SET org_id = COALESCE(
+               config -> 'configurable' ->> 'org_id',
+               execution_params -> 'run_metadata' ->> 'org_id'
+           )
+     WHERE status IN ('pending', 'running')
+       AND org_id IS NULL
+    """
+)
 
 
 def upgrade() -> None:
     op.add_column("runs", sa.Column("org_id", sa.Text(), nullable=True))
-
-    connection = op.get_bind()
-    while True:
-        result = connection.execute(
-            sa.text(
-                """
-                UPDATE runs SET org_id = config -> 'configurable' ->> 'org_id'
-                 WHERE run_id IN (
-                       SELECT run_id FROM runs
-                        WHERE org_id IS NULL
-                          AND config -> 'configurable' ->> 'org_id' IS NOT NULL
-                        LIMIT :batch
-                 )
-                """
-            ),
-            {"batch": BACKFILL_BATCH_SIZE},
-        )
-        if result.rowcount < BACKFILL_BATCH_SIZE:
-            break
+    op.get_bind().execute(BACKFILL_ACTIVE_RUNS)
 
     with op.get_context().autocommit_block():
         op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {INDEX_NAME}")

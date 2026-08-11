@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from functools import lru_cache
 from typing import Annotated
 from urllib.parse import parse_qsl, quote_plus, urlencode
 
@@ -451,6 +452,18 @@ class CronSettings(EnvBase):
         return self
 
 
+@lru_cache(maxsize=8)
+def _parse_limit_overrides(raw: str) -> dict[str, int]:
+    """Parse the per-org override JSON. Keyed on the raw string, so a changed
+    value (including in tests) parses afresh."""
+    if not raw.strip():
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise TypeError("ORG_RUN_LIMIT_OVERRIDES must be a JSON object")
+    return {str(org): int(limit) for org, limit in parsed.items()}
+
+
 class RunLimitSettings(EnvBase):
     """Per-organization concurrent run limits.
 
@@ -492,13 +505,12 @@ class RunLimitSettings(EnvBase):
     @computed_field
     @property
     def limit_overrides(self) -> dict[str, int]:
-        """Parse ORG_RUN_LIMIT_OVERRIDES into a mapping."""
-        if not self.ORG_RUN_LIMIT_OVERRIDES.strip():
-            return {}
-        parsed = json.loads(self.ORG_RUN_LIMIT_OVERRIDES)
-        if not isinstance(parsed, dict):
-            raise TypeError("ORG_RUN_LIMIT_OVERRIDES must be a JSON object")
-        return {str(org): int(limit) for org, limit in parsed.items()}
+        """Parse ORG_RUN_LIMIT_OVERRIDES into a mapping.
+
+        Cached on the raw string: the promoter reads this once per candidate
+        run, so an uncached parse would run hundreds of times per tick.
+        """
+        return _parse_limit_overrides(self.ORG_RUN_LIMIT_OVERRIDES)
 
     @model_validator(mode="after")
     def _validate(self) -> "RunLimitSettings":

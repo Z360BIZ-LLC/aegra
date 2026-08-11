@@ -1,12 +1,12 @@
 """Unit tests for the queued-run promoter."""
 
-from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from aegra_api.services import run_promoter as mod
-from aegra_api.services.run_promoter import RunPromoter, _webhook_url_for
+from aegra_api.services.run_limits import ExpiredRun
+from aegra_api.services.run_promoter import RunPromoter
 
 WEBHOOK = "https://app.example.test/webhooks/ai/run"
 
@@ -32,12 +32,13 @@ def promote_calls(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def terminal_calls(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMock]:
-    """Capture finalize_run and send_run_webhook calls."""
-    finalize = AsyncMock()
+    """Capture the expiry claim and the webhook it guards. Claim wins by default."""
+    claim = AsyncMock(return_value=True)
     webhook = AsyncMock()
-    monkeypatch.setattr(mod, "finalize_run", finalize)
+    monkeypatch.setattr(mod.run_limits, "claim_expired_run", claim)
+    monkeypatch.setattr(mod, "set_thread_status", AsyncMock())
     monkeypatch.setattr(mod, "send_run_webhook", webhook)
-    return finalize, webhook
+    return claim, webhook
 
 
 def _patch_lookups(
@@ -50,20 +51,8 @@ def _patch_lookups(
     monkeypatch.setattr(mod.run_limits, "find_expired_queued_runs", AsyncMock(return_value=expired or []))
 
 
-def _run_orm(*, run_id: str = "run-1", webhook_url: str | None = WEBHOOK) -> MagicMock:
-    orm = MagicMock()
-    orm.run_id = run_id
-    orm.thread_id = "thread-1"
-    orm.org_id = "7-z360"
-    orm.created_at = datetime.now(UTC)
-    orm.execution_params = {
-        "graph_id": "slow_agent",
-        "user": {"identity": "anonymous", "is_authenticated": True, "permissions": []},
-        "execution": {},
-        "behavior": {"webhook_url": webhook_url},
-        "run_metadata": {},
-    }
-    return orm
+def _expired(*, run_id: str = "run-1", webhook_url: str | None = WEBHOOK) -> ExpiredRun:
+    return ExpiredRun(run_id=run_id, thread_id="thread-1", org_id="7-z360", webhook_url=webhook_url)
 
 
 class TestPromotion:
@@ -102,13 +91,12 @@ class TestQueueExpiry:
     async def test_expired_run_is_failed_and_webhooked(
         self, monkeypatch: pytest.MonkeyPatch, promote_calls: AsyncMock, terminal_calls: tuple
     ) -> None:
-        finalize, webhook = terminal_calls
-        _patch_lookups(monkeypatch, expired=[_run_orm()])
+        claim, webhook = terminal_calls
+        _patch_lookups(monkeypatch, expired=[_expired()])
 
         await RunPromoter().tick()
 
-        assert finalize.await_args.kwargs["status"] == "error"
-        assert finalize.await_args.kwargs["thread_status"] == "error"
+        assert claim.await_args.kwargs["error"] == mod._QUEUE_EXPIRY_ERROR
         assert webhook.await_args.kwargs["status"] == "error"
         assert webhook.await_args.kwargs["webhook_url"] == WEBHOOK
         assert webhook.await_args.kwargs["error_message"] == mod._QUEUE_EXPIRY_ERROR
@@ -116,38 +104,69 @@ class TestQueueExpiry:
     async def test_run_without_webhook_is_still_failed(
         self, monkeypatch: pytest.MonkeyPatch, promote_calls: AsyncMock, terminal_calls: tuple
     ) -> None:
-        finalize, webhook = terminal_calls
-        _patch_lookups(monkeypatch, expired=[_run_orm(webhook_url=None)])
+        claim, webhook = terminal_calls
+        _patch_lookups(monkeypatch, expired=[_expired(webhook_url=None)])
 
         await RunPromoter().tick()
 
-        finalize.assert_awaited_once()
+        claim.assert_awaited_once()
         webhook.assert_not_awaited()
 
     async def test_expires_every_overdue_run(
         self, monkeypatch: pytest.MonkeyPatch, promote_calls: AsyncMock, terminal_calls: tuple
     ) -> None:
-        finalize, _ = terminal_calls
-        _patch_lookups(monkeypatch, expired=[_run_orm(run_id="a"), _run_orm(run_id="b")])
+        claim, _ = terminal_calls
+        _patch_lookups(monkeypatch, expired=[_expired(run_id="a"), _expired(run_id="b")])
 
         await RunPromoter().tick()
 
-        assert finalize.await_count == 2
+        assert claim.await_count == 2
 
+    async def test_no_webhook_when_the_run_started_before_we_expired_it(
+        self, monkeypatch: pytest.MonkeyPatch, promote_calls: AsyncMock, terminal_calls: tuple
+    ) -> None:
+        """A worker can claim a run between the expiry scan and the update.
 
-class TestWebhookUrlLookup:
-    def test_reads_url_from_execution_params(self) -> None:
-        assert _webhook_url_for(_run_orm()) == WEBHOOK
+        Losing the conditional claim must mean silence — otherwise a run that
+        is still executing gets a failure webhook and then a success one.
+        """
+        claim, webhook = terminal_calls
+        claim.return_value = False
+        _patch_lookups(monkeypatch, expired=[_expired()])
 
-    def test_returns_none_without_execution_params(self) -> None:
-        orm = _run_orm()
-        orm.execution_params = None
-        assert _webhook_url_for(orm) is None
+        await RunPromoter().tick()
 
-    def test_returns_none_for_unreadable_params(self) -> None:
-        orm = _run_orm()
-        orm.execution_params = {"behavior": {}}
-        assert _webhook_url_for(orm) is None
+        webhook.assert_not_awaited()
+
+    async def test_only_the_pod_that_wins_the_row_notifies(
+        self, monkeypatch: pytest.MonkeyPatch, promote_calls: AsyncMock, terminal_calls: tuple
+    ) -> None:
+        """Every pod runs a promoter, so the loser must not double-notify."""
+        claim, webhook = terminal_calls
+        claim.side_effect = [True, False]
+        _patch_lookups(monkeypatch, expired=[_expired(run_id="a"), _expired(run_id="b")])
+
+        await RunPromoter().tick()
+
+        assert webhook.await_count == 1
+
+    async def test_expiry_runs_before_promotion(
+        self, monkeypatch: pytest.MonkeyPatch, promote_calls: AsyncMock, terminal_calls: tuple
+    ) -> None:
+        """Otherwise a doomed run can be dispatched moments before being killed."""
+        order: list[str] = []
+        claim, _ = terminal_calls
+        claim.side_effect = lambda *a, **k: order.append("expire") or True
+        monkeypatch.setattr(
+            mod.run_limits,
+            "find_promotable_runs",
+            AsyncMock(side_effect=lambda *a, **k: order.append("promote") or []),
+        )
+        monkeypatch.setattr(mod.run_limits, "find_expired_queued_runs", AsyncMock(return_value=[_expired()]))
+
+        await RunPromoter().tick()
+
+        assert order == ["expire", "promote"]
 
 
 class TestLifecycle:
