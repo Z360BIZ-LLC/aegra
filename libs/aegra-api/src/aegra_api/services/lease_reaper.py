@@ -112,6 +112,12 @@ class LeaseReaper:
             )
             crashed = [row[0] for row in crashed_result.fetchall()]
 
+            # The run promoter owns pending runs while limits are enforcing:
+            # this sweep has no capacity check, so it would re-enqueue runs
+            # deliberately held behind an org's ceiling.
+            if settings.run_limits.enforcing:
+                return crashed, []
+
             stuck_result = await session.execute(
                 select(RunORM.run_id).where(
                     RunORM.status == "pending",

@@ -1,4 +1,4 @@
-.PHONY: help install dev-install setup-hooks format lint type-check security test test-api test-cli test-cov clean run ci-check openapi e2e-dev e2e-prod e2e-both
+.PHONY: help install dev-install setup-hooks format lint type-check security test test-api test-cli test-cov clean run ci-check openapi e2e-dev e2e-prod e2e-both e2e-run-limits
 
 help:
 	@echo "Available commands:"
@@ -18,6 +18,7 @@ help:
 	@echo "  make e2e-dev       - Run E2E tests in dev mode (no Redis)"
 	@echo "  make e2e-prod      - Run E2E tests in prod mode (Redis workers)"
 	@echo "  make e2e-both      - Run E2E tests in both modes"
+	@echo "  make e2e-run-limits - Run per-org run-limit E2E tests (add REDIS=1 for worker mode)"
 	@echo "  make clean         - Clean cache files"
 	@echo "  make run           - Run the server"
 
@@ -105,6 +106,50 @@ e2e-prod:
 	exit $$rc
 
 e2e-both: e2e-dev e2e-prod
+
+# Per-org run limits need a bespoke server: a low ceiling plus a graph slow
+# enough to observe queueing. Runs uvicorn directly against the compose
+# Postgres — no image rebuild, and it exercises both executor modes.
+# Usage: make e2e-run-limits            (dev mode, LocalExecutor)
+#        make e2e-run-limits REDIS=1    (prod mode, WorkerExecutor)
+RUN_LIMITS_HARNESS := libs/aegra-api/tests/e2e/harness/run_limits
+RUN_LIMITS_PORT := 2029
+RUN_LIMITS_CEILING := 2
+
+e2e-run-limits:
+	@docker compose up -d postgres $(if $(REDIS),redis,)
+	@echo "Waiting for Postgres..."; \
+	for i in $$(seq 1 30); do \
+		docker compose exec -T postgres pg_isready -U user -d aegra > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done
+	@set -e; \
+	export DATABASE_URL=postgresql://user:password@localhost:5434/aegra; \
+	export AEGRA_CONFIG=$(PWD)/$(RUN_LIMITS_HARNESS)/aegra.json; \
+	export SERVER_URL=http://127.0.0.1:$(RUN_LIMITS_PORT); \
+	export AUTH_TYPE=noop BACKFILL_THREAD_STATE_ON_STARTUP=false; \
+	export ORG_RUN_LIMIT_MODE=enforce ORG_MAX_CONCURRENT_RUNS=$(RUN_LIMITS_CEILING); \
+	export ORG_RUN_PROMOTER_INTERVAL_SECONDS=1 SLEEP_GRAPH_SECONDS=6; \
+	export AEGRA_E2E_ORG_RUN_LIMIT=$(RUN_LIMITS_CEILING); \
+	if [ -n "$(REDIS)" ]; then \
+		export REDIS_BROKER_ENABLED=true WORKER_COUNT=2 N_JOBS_PER_WORKER=10; \
+		export REDIS_URL=redis://localhost:$$(docker compose port redis 6379 | cut -d: -f2)/3; \
+	else \
+		export REDIS_BROKER_ENABLED=false; \
+	fi; \
+	uv run --package aegra-api uvicorn aegra_api.main:app \
+		--host 127.0.0.1 --port $(RUN_LIMITS_PORT) > /tmp/aegra-run-limits.log 2>&1 & \
+	echo $$! > /tmp/aegra-run-limits.pid; \
+	for i in $$(seq 1 30); do \
+		curl -sf http://127.0.0.1:$(RUN_LIMITS_PORT)/health > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done; \
+	rc=0; \
+	SERVER_URL=http://127.0.0.1:$(RUN_LIMITS_PORT) AEGRA_E2E_ORG_RUN_LIMIT=$(RUN_LIMITS_CEILING) \
+		uv run --package aegra-api pytest libs/aegra-api/tests/e2e/test_runs/test_org_run_limits.py -v --tb=short || rc=$$?; \
+	kill $$(cat /tmp/aegra-run-limits.pid) 2>/dev/null || true; \
+	rm -f /tmp/aegra-run-limits.pid; \
+	exit $$rc
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true

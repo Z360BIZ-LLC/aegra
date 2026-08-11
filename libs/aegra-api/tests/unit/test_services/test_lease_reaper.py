@@ -6,6 +6,7 @@ import pytest
 from redis import RedisError
 
 from aegra_api.services.lease_reaper import LeaseReaper
+from aegra_api.settings import settings
 
 
 def _make_session_maker(session: AsyncMock) -> MagicMock:
@@ -47,6 +48,25 @@ class TestFindRecoverable:
 
         assert crashed == []
         assert stuck == []
+
+    @pytest.mark.asyncio
+    async def test_stuck_pending_is_left_to_the_promoter_when_limits_enforce(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This sweep has no capacity check, so it must not fight the promoter."""
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
+        session = AsyncMock()
+        crashed_result = MagicMock()
+        crashed_result.fetchall.return_value = [("run-1",)]
+        session.execute = AsyncMock(return_value=crashed_result)
+        maker = _make_session_maker(session)
+
+        with patch("aegra_api.services.lease_reaper._get_session_maker", return_value=maker):
+            crashed, stuck = await LeaseReaper._find_recoverable()
+
+        assert crashed == ["run-1"]
+        assert stuck == []
+        assert session.execute.await_count == 1
 
 
 class TestResetToPending:

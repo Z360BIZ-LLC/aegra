@@ -1,0 +1,5 @@
+{
+  "graphs": {
+    "sleeper": "./sleep_graph.py:graph"
+  }
+}

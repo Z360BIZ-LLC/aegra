@@ -259,6 +259,56 @@ sequenceDiagram
   `aegra dev` is designed for fast iteration — no Redis, no workers, no leases. Just start coding and your runs execute immediately in-process.
 </Tip>
 
+## Per-organization run limits
+
+A single tenant bursting can consume every job slot on the cluster. Run limits
+cap how many runs one organization may execute at once, across every graph.
+
+Over-limit runs are **never rejected**. The runs table is already the queue of
+record, so a run held at the ceiling simply stays `pending` until a slot frees:
+
+1. The run is created and enqueued exactly as usual.
+2. A worker picks it up and attempts the claim. The claim takes a
+   transaction-scoped advisory lock on the org, counts its active runs, and
+   refuses the `pending → running` transition when the org is full.
+3. The run stays `pending`. The worker moves on rather than spinning on it.
+4. `RunPromoter` watches for freed capacity and re-dispatches the oldest queued
+   run for each org, oldest-first and fairly across orgs.
+
+The tenant key comes from the run's `config.configurable.org_id` (rename via
+`ORG_ID_CONFIG_KEY`). Runs without one are exempt rather than sharing a single
+anonymous bucket, which would let one caller starve the quota for everyone.
+
+Capacity is counted from the runs table rather than an incrementing counter: a
+crashed worker's lease expires and the reaper resets its row, so the count
+self-heals where a counter would leak a slot permanently.
+
+<Note>
+  While limits are enforcing, the lease reaper's stuck-pending sweep is
+  disabled — it has no capacity check and would re-enqueue runs the promoter is
+  deliberately holding. The promoter covers that case instead.
+</Note>
+
+<Warning>
+  A queued run holds its caller's SSE or `/join` connection open (keepalives
+  keep the connection alive), so a client sees latency, not an error. Runs that
+  wait past `ORG_RUN_MAX_QUEUE_WAIT_SECONDS` are failed and their webhook fires
+  with `status: "error"`, handing the retry decision back to the caller.
+</Warning>
+
+| Variable | Default | Description |
+|:---------|:--------|:------------|
+| `ORG_RUN_LIMIT_MODE` | `off` | `off`, `shadow` (metrics only), or `enforce` |
+| `ORG_MAX_CONCURRENT_RUNS` | `20` | Concurrent runs allowed per organization |
+| `ORG_RUN_LIMIT_OVERRIDES` | `` | JSON per-org overrides, e.g. `{"acme": 40}` |
+| `ORG_RUN_MAX_QUEUE_WAIT_SECONDS` | `9000` | Queue wait before a run is failed (150 min) |
+| `ORG_ID_CONFIG_KEY` | `org_id` | Key holding the tenant id in `config.configurable` |
+| `ORG_RUN_PROMOTER_INTERVAL_SECONDS` | `2.0` | How often freed capacity is checked |
+| `ORG_RUN_PROMOTER_BATCH_SIZE` | `100` | Runs dispatched per promoter pass |
+
+Both executors route their claim through `run_limits.try_start_run`, so the
+policy holds in dev mode as well as production.
+
 ## Redis data layout
 
 | Key | Purpose | Written by | Read by |
@@ -305,6 +355,8 @@ All worker settings are configured via environment variables. See the [environme
 | `services/run_status.py` | Database status updates |
 | `services/run_preparation.py` | Run creation (validate, persist, submit) |
 | `services/lease_reaper.py` | Background task recovering crashed worker runs |
+| `services/run_limits.py` | Per-organization concurrency policy and capacity-gated claim |
+| `services/run_promoter.py` | Dispatches queued runs as org capacity frees; expires overdue ones |
 | `services/broker.py` | In-memory broker + factory |
 | `services/redis_broker.py` | Redis pub/sub broker for SSE |
 | `services/streaming_service.py` | SSE orchestration (replay + live) |

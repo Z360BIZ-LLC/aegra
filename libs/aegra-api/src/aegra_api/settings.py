@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from typing import Annotated
@@ -450,6 +451,82 @@ class CronSettings(EnvBase):
         return self
 
 
+class RunLimitSettings(EnvBase):
+    """Per-organization concurrent run limits.
+
+    Caps how many runs one tenant may execute at once, across every graph.
+    Over-limit runs are not rejected — they stay ``pending`` and a promoter
+    dispatches them as the tenant's slots free up.
+
+    Defaults to ``off`` so the feature is inert until an operator opts in.
+    """
+
+    # off = no limiting; shadow = measure only (emits metrics, never gates);
+    # enforce = gate dispatch on available capacity.
+    ORG_RUN_LIMIT_MODE: LowerStr = "off"
+    ORG_MAX_CONCURRENT_RUNS: int = 20
+    # JSON object of per-org overrides, e.g. '{"7-z360": 40}'. Orgs absent
+    # from the map use ORG_MAX_CONCURRENT_RUNS.
+    ORG_RUN_LIMIT_OVERRIDES: str = ""
+    # A run queued longer than this is failed rather than started against a
+    # conversation that has long since moved on.
+    ORG_RUN_MAX_QUEUE_WAIT_SECONDS: int = 9000
+    # Where to find the tenant key inside the run's config.configurable.
+    # Kept configurable so the module isn't tied to one deployment's schema.
+    ORG_ID_CONFIG_KEY: str = "org_id"
+    ORG_RUN_PROMOTER_INTERVAL_SECONDS: float = 2.0
+    ORG_RUN_PROMOTER_BATCH_SIZE: int = 100
+
+    @computed_field
+    @property
+    def enabled(self) -> bool:
+        """True when the policy should evaluate (shadow or enforce)."""
+        return self.ORG_RUN_LIMIT_MODE in ("shadow", "enforce")
+
+    @computed_field
+    @property
+    def enforcing(self) -> bool:
+        """True only when the policy may actually withhold a run."""
+        return self.ORG_RUN_LIMIT_MODE == "enforce"
+
+    @computed_field
+    @property
+    def limit_overrides(self) -> dict[str, int]:
+        """Parse ORG_RUN_LIMIT_OVERRIDES into a mapping."""
+        if not self.ORG_RUN_LIMIT_OVERRIDES.strip():
+            return {}
+        parsed = json.loads(self.ORG_RUN_LIMIT_OVERRIDES)
+        if not isinstance(parsed, dict):
+            raise TypeError("ORG_RUN_LIMIT_OVERRIDES must be a JSON object")
+        return {str(org): int(limit) for org, limit in parsed.items()}
+
+    @model_validator(mode="after")
+    def _validate(self) -> "RunLimitSettings":
+        """Reject invalid modes and non-positive tuning values at startup."""
+        valid_modes = ("off", "shadow", "enforce")
+        if self.ORG_RUN_LIMIT_MODE not in valid_modes:
+            raise ValueError(f"ORG_RUN_LIMIT_MODE must be one of {valid_modes}, got {self.ORG_RUN_LIMIT_MODE!r}")
+        if self.ORG_MAX_CONCURRENT_RUNS <= 0:
+            raise ValueError(f"ORG_MAX_CONCURRENT_RUNS must be greater than 0, got {self.ORG_MAX_CONCURRENT_RUNS}")
+        if self.ORG_RUN_MAX_QUEUE_WAIT_SECONDS <= 0:
+            raise ValueError(
+                f"ORG_RUN_MAX_QUEUE_WAIT_SECONDS must be greater than 0, got {self.ORG_RUN_MAX_QUEUE_WAIT_SECONDS}"
+            )
+        if self.ORG_RUN_PROMOTER_INTERVAL_SECONDS <= 0:
+            raise ValueError(
+                f"ORG_RUN_PROMOTER_INTERVAL_SECONDS must be greater than 0, "
+                f"got {self.ORG_RUN_PROMOTER_INTERVAL_SECONDS}"
+            )
+        if self.ORG_RUN_PROMOTER_BATCH_SIZE <= 0:
+            raise ValueError(
+                f"ORG_RUN_PROMOTER_BATCH_SIZE must be greater than 0, got {self.ORG_RUN_PROMOTER_BATCH_SIZE}"
+            )
+        # Surface a malformed overrides JSON at boot rather than on the first
+        # limited run: the computed field would otherwise raise mid-request.
+        _ = self.limit_overrides
+        return self
+
+
 class EventStreamingSettings(EnvBase):
     """Agent Protocol v2 event streaming (/threads/{id}/stream/events + /commands).
 
@@ -475,6 +552,7 @@ class Settings:
         self.redis = RedisSettings()
         self.worker = WorkerSettings()
         self.cron = CronSettings()
+        self.run_limits = RunLimitSettings()
         self.event_streaming = EventStreamingSettings()
 
 

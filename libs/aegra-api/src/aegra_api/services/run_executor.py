@@ -100,7 +100,7 @@ async def execute_run(job: RunJob) -> None:
                 materialized_interrupts=final_output.state_interrupts,
             )
             _emit_run_terminal_metrics(job, "success", started_at)
-            await _send_run_webhook(job, "completed", final_output.data)
+            await _send_run_webhook(job, "success", final_output.data)
 
     except asyncio.CancelledError:
         if run_id in _lease_loss_cancellations:
@@ -121,7 +121,7 @@ async def execute_run(job: RunJob) -> None:
         safe_message = f"{type(exc).__name__}: execution failed"
         await finalize_run(run_id, thread_id, status="error", thread_status="error", output={}, error=str(exc))
         _emit_run_terminal_metrics(job, "error", started_at, error_class=type(exc).__name__)
-        await _send_run_webhook(job, "failed", {}, error_message=str(exc))
+        await _send_run_webhook(job, "error", {}, error_message=str(exc))
         await _best_effort_signal(streaming_service.signal_run_error, run_id, safe_message, type(exc).__name__)
     else:
         status = "interrupted" if final_output.has_interrupt else "success"

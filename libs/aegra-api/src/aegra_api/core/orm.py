@@ -196,6 +196,10 @@ class Run(Base):
     claimed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
+    # Tenant key for per-organization concurrency limits, resolved at run
+    # creation. NULL means "no tenant" and is exempt from limits.
+    org_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Indexes for performance
     __table_args__ = (
         Index("idx_runs_thread_id", "thread_id"),
@@ -204,6 +208,14 @@ class Run(Base):
         Index("idx_runs_assistant_id", "assistant_id"),
         Index("idx_runs_created_at", "created_at"),
         Index("idx_runs_lease_reaper", "status", "lease_expires_at"),
+        # Backs both the per-org active count and the promoter's candidate
+        # scan; partial so it stays tiny relative to the full runs table.
+        Index(
+            "idx_runs_org_active",
+            "org_id",
+            "created_at",
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
     )
 
 

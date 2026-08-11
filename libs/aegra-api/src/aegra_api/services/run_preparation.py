@@ -24,6 +24,7 @@ from aegra_api.models import Run, RunCreate, User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
+from aegra_api.services.run_limits import resolve_org_id
 from aegra_api.services.run_status import set_thread_status
 from aegra_api.utils.assistants import resolve_assistant_id
 from aegra_api.utils.run_utils import _merge_jsonb
@@ -295,6 +296,7 @@ async def _prepare_run(
         config=config,
         context=context,
         user_id=user.identity,
+        org_id=resolve_org_id(config, request.metadata),
         created_at=now,
         updated_at=now,
         output=None,

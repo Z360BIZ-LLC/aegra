@@ -42,6 +42,7 @@ from aegra_api.services.cron_scheduler import cron_scheduler
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
+from aegra_api.services.run_promoter import run_promoter
 from aegra_api.services.state_backfill import run_startup_backfill
 from aegra_api.settings import settings
 from aegra_api.utils.setup_logging import setup_logging
@@ -174,6 +175,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if settings.cron.CRON_ENABLED:
         await cron_scheduler.start()
 
+    # Start run promoter (dispatches runs queued behind org concurrency limits)
+    if settings.run_limits.enforcing:
+        await run_promoter.start()
+
     # One-time materialized-state backfill for pre-existing threads. Runs in the
     # background (never blocks startup); guarded by an advisory lock + completion
     # marker so only one instance runs it and only until it's done once.
@@ -208,7 +213,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await backfill_task_handle
 
-    # Shutdown order: cron → reaper → executor (drains jobs) → broker → Redis → DB
+    # Shutdown order: promoter → cron → reaper → executor (drains jobs) → broker → Redis → DB
+    if settings.run_limits.enforcing:
+        await run_promoter.stop()
     if settings.cron.CRON_ENABLED:
         await cron_scheduler.stop()
     if settings.redis.REDIS_BROKER_ENABLED:

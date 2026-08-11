@@ -8,6 +8,7 @@ import pytest
 from aegra_api.models.auth import User
 from aegra_api.models.run_job import RunExecution, RunIdentity, RunJob
 from aegra_api.services.local_executor import LocalExecutor
+from aegra_api.settings import settings
 
 
 async def _empty_async_gen():
@@ -42,6 +43,51 @@ class TestLocalExecutor:
             assert "run-1" in active_runs
             task = active_runs.pop("run-1")
             task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_submit_leaves_run_queued_when_org_is_at_capacity(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Over-limit runs stay pending for the promoter — never dropped."""
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
+        monkeypatch.setattr(
+            LocalExecutor,
+            "_claim",
+            AsyncMock(return_value=False),
+        )
+        executor = LocalExecutor()
+
+        with patch("aegra_api.services.run_executor.execute_run", AsyncMock()):
+            await executor.submit(_make_job("run-queued"))
+
+        from aegra_api.core.active_runs import active_runs
+
+        assert "run-queued" not in active_runs
+
+    @pytest.mark.asyncio
+    async def test_submit_starts_run_when_capacity_is_available(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
+        monkeypatch.setattr(LocalExecutor, "_claim", AsyncMock(return_value=True))
+        executor = LocalExecutor()
+
+        with (
+            patch("aegra_api.services.run_executor.execute_run", AsyncMock()),
+            patch("aegra_api.services.local_executor.make_run_trace_context", return_value=None),
+        ):
+            await executor.submit(_make_job("run-admitted"))
+
+        from aegra_api.core.active_runs import active_runs
+
+        assert "run-admitted" in active_runs
+        active_runs.pop("run-admitted").cancel()
+
+    @pytest.mark.asyncio
+    async def test_promote_skips_run_without_execution_params(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(LocalExecutor, "_load_job", AsyncMock(return_value=None))
+        claim = AsyncMock(return_value=True)
+        monkeypatch.setattr(LocalExecutor, "_claim", claim)
+
+        await LocalExecutor().promote("run-missing")
+
+        claim.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_wait_for_completion_returns_on_done(self) -> None:
