@@ -131,8 +131,11 @@ class WebhookService:
             webhook_url: The URL to POST to
             run_id: Run identifier
             thread_id: Thread identifier
-            status: Final run status (completed, failed, cancelled, interrupted)
-            output: Run output data (if completed)
+            status: Final run status. Uses the same vocabulary as the runs
+                API (``success``, ``error``, ``interrupted``) plus
+                ``cancelled``, which the run status column cannot express —
+                it stores a caller-issued cancel as ``interrupted`` too.
+            output: Run output data (empty on the error and cancel paths)
             error_message: Error message (if failed)
             max_retries: Number of retry attempts
 
@@ -163,7 +166,7 @@ class WebhookService:
         payload = {
             "run_id": run_id,
             "thread_id": thread_id,
-            "status": "success" if status == "completed" else status,
+            "status": status,
             "values": serialized_output,
         }
 

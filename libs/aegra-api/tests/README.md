@@ -123,6 +123,7 @@ from tests.fixtures.clients import create_test_app, make_client
 import pytest
 from src.agent_server.utils import generate_event_id
 
+
 @pytest.mark.unit
 def test_generate_event_id():
     event_id = generate_event_id("run-123", 1)
@@ -135,6 +136,7 @@ def test_generate_event_id():
 import pytest
 from tests.fixtures.database import DummySessionBase
 
+
 @pytest.mark.integration
 async def test_create_assistant():
     # Test with real database interactions
@@ -146,6 +148,7 @@ async def test_create_assistant():
 # tests/e2e/test_assistants/test_assistant_crud.py
 import pytest
 from tests.e2e._utils import get_e2e_client
+
 
 @pytest.mark.e2e
 async def test_full_assistant_workflow():

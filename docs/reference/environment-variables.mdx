@@ -149,6 +149,28 @@ In dev mode (`REDIS_BROKER_ENABLED=false`), runs execute as in-process asyncio t
 
 Total capacity per instance = `WORKER_COUNT` x `N_JOBS_PER_WORKER` (default: 30 concurrent runs).
 
+## Per-organization run limits
+
+Caps how many runs one organization may execute at once, across every graph, so
+a single tenant cannot consume every job slot. Over-limit runs are queued rather
+than rejected. See the [worker architecture guide](/guides/worker-architecture).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ORG_RUN_LIMIT_MODE` | `off` | `off` disables the feature, `shadow` emits metrics without gating, `enforce` holds over-limit runs |
+| `ORG_MAX_CONCURRENT_RUNS` | `20` | Concurrent runs allowed per organization |
+| `ORG_RUN_LIMIT_OVERRIDES` | `` | JSON object of per-org overrides, e.g. `{"acme": 40}`. Orgs not listed use `ORG_MAX_CONCURRENT_RUNS` |
+| `ORG_RUN_MAX_QUEUE_WAIT_SECONDS` | `9000` | A run queued longer than this is failed rather than started late (150 minutes) |
+| `ORG_ID_CONFIG_KEY` | `org_id` | Key holding the tenant id inside the run's `config.configurable` |
+| `ORG_RUN_PROMOTER_INTERVAL_SECONDS` | `2.0` | How often the promoter looks for freed capacity |
+| `ORG_RUN_PROMOTER_BATCH_SIZE` | `100` | Maximum runs dispatched per promoter pass |
+
+<Note>
+Runs whose config carries no tenant key are exempt from limits rather than
+sharing one anonymous bucket, which would let a single caller starve the quota
+for every other tenant.
+</Note>
+
 ## Cron scheduler
 
 The background scheduler polls the database for due cron jobs and fires them as runs.

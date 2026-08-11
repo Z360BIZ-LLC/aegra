@@ -10,6 +10,7 @@ from redis import TimeoutError as RedisTimeoutError
 from aegra_api.core.active_runs import active_runs
 from aegra_api.models.auth import User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
+from aegra_api.services import run_limits
 from aegra_api.services.worker_executor import (
     WorkerExecutor,
     _acquire_and_load,
@@ -107,6 +108,28 @@ class TestIsValidRunId:
 # ------------------------------------------------------------------
 # _acquire_and_load
 # ------------------------------------------------------------------
+
+
+class TestCapacityGate:
+    @pytest.mark.asyncio
+    async def test_run_held_at_org_limit_is_not_loaded(self) -> None:
+        """At capacity the run stays pending — the promoter owns it now."""
+        session = AsyncMock()
+        session.rollback = AsyncMock()
+        maker = _make_session_maker(session)
+
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=maker),
+            patch(
+                f"{MODULE}.run_limits.try_start_run",
+                AsyncMock(return_value=run_limits.ClaimOutcome.AT_CAPACITY),
+            ),
+        ):
+            result = await _acquire_and_load("run-1", "worker-1")
+
+        assert result is None
+        session.rollback.assert_awaited_once()
+        session.commit.assert_not_awaited()
 
 
 class TestAcquireAndLoad:

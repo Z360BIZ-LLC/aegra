@@ -17,6 +17,15 @@ class BaseExecutor(ABC):
         """Enqueue a job for execution. Returns immediately."""
 
     @abstractmethod
+    async def promote(self, run_id: str) -> None:
+        """Re-dispatch a run that stayed queued behind its org's run limit.
+
+        Called by the promoter once the org has a free slot. The dispatch
+        path re-checks capacity, so a promotion that races another worker is
+        harmless.
+        """
+
+    @abstractmethod
     async def wait_for_completion(self, run_id: str, *, timeout: float = 300.0) -> None:
         """Block until the run reaches a terminal state or timeout expires."""
 

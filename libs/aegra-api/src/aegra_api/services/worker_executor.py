@@ -20,7 +20,7 @@ import structlog
 from asgi_correlation_id import correlation_id
 from redis import RedisError
 from redis import TimeoutError as RedisTimeoutError
-from sqlalchemy import select, update
+from sqlalchemy import Select, select, update
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.orm import Run as RunORM
@@ -28,6 +28,7 @@ from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
 from aegra_api.observability.span_enrichment import merge_run_metadata, set_trace_context
+from aegra_api.services import run_limits
 from aegra_api.services.base_executor import BaseExecutor
 from aegra_api.services.run_executor import _lease_loss_cancellations, execute_run
 from aegra_api.services.run_status import finalize_run, update_run_status
@@ -59,11 +60,18 @@ class WorkerExecutor(BaseExecutor):
     # ------------------------------------------------------------------
 
     async def submit(self, job: RunJob) -> None:
+        await self._enqueue(job.identity.run_id)
+
+    async def promote(self, run_id: str) -> None:
+        await self._enqueue(run_id)
+
+    @staticmethod
+    async def _enqueue(run_id: str) -> None:
         client = redis_manager.get_client()
-        await client.rpush(settings.worker.WORKER_QUEUE_KEY, job.identity.run_id)  # type: ignore[arg-type]
+        await client.rpush(settings.worker.WORKER_QUEUE_KEY, run_id)  # type: ignore[arg-type]
         logger.info(
             "Enqueued run_id to job queue",
-            run_id=job.identity.run_id,
+            run_id=run_id,
             queue=settings.worker.WORKER_QUEUE_KEY,
         )
 
@@ -315,21 +323,36 @@ class WorkerExecutor(BaseExecutor):
 
     @staticmethod
     async def _poll_postgres() -> str | None:
-        """Pick the oldest pending, unclaimed run from Postgres."""
+        """Pick the oldest pending, unclaimed run from Postgres.
+
+        Skips runs whose org is at its limit, otherwise this fallback would
+        return the same blocked run on every poll while Redis is down.
+        """
         maker = _get_session_maker()
         async with maker() as session:
-            run_id = await session.scalar(
-                select(RunORM.run_id)
-                .where(RunORM.status == "pending", RunORM.claimed_by.is_(None))
-                .order_by(RunORM.created_at.asc())
-                .limit(1)
-            )
-            return run_id
+            if settings.run_limits.enforcing:
+                promotable = await run_limits.find_promotable_runs(session, batch_size=1)
+                if promotable:
+                    return promotable[0]
+                # Runs with no tenant are never gated, so pick them up
+                # immediately rather than waiting out the promoter's
+                # stuck-run threshold on this already-degraded path.
+                return await session.scalar(_oldest_pending_stmt(unscoped_only=True))
+
+            return await session.scalar(_oldest_pending_stmt(unscoped_only=False))
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+
+def _oldest_pending_stmt(*, unscoped_only: bool) -> Select[tuple[str]]:
+    """Select the oldest unclaimed pending run, optionally only tenant-less ones."""
+    stmt = select(RunORM.run_id).where(RunORM.status == "pending", RunORM.claimed_by.is_(None))
+    if unscoped_only:
+        stmt = stmt.where(RunORM.org_id.is_(None))
+    return stmt.order_by(RunORM.created_at.asc()).limit(1)
 
 
 async def _get_thread_id_for_run(run_id: str) -> str | None:
@@ -364,16 +387,18 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
     lease_until = datetime.now(UTC) + timedelta(seconds=settings.worker.LEASE_DURATION_SECONDS)
     maker = _get_session_maker()
     async with maker() as session:
-        result = await session.execute(
-            update(RunORM)
-            .where(
-                RunORM.run_id == run_id,
-                RunORM.status == "pending",
-                RunORM.claimed_by.is_(None),
-            )
-            .values(claimed_by=worker_name, lease_expires_at=lease_until, status="running")
+        # try_start_run holds an org advisory lock for the rest of this
+        # transaction, so the capacity check it made cannot go stale.
+        outcome = await run_limits.try_start_run(
+            session,
+            run_id,
+            claimed_by=worker_name,
+            lease_expires_at=lease_until,
         )
-        if result.rowcount == 0:  # type: ignore[union-attr]
+        if outcome is not run_limits.ClaimOutcome.CLAIMED:
+            # AT_CAPACITY leaves the run pending on purpose — the promoter
+            # re-dispatches it when the org frees a slot. Re-enqueueing here
+            # would spin the worker on a run it cannot start.
             await session.rollback()
             return None
 

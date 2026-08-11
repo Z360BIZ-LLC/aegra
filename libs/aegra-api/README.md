@@ -137,13 +137,16 @@ Agents are Python modules exporting a compiled `graph` variable:
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 
+
 class State(TypedDict):
     messages: list[str]
+
 
 def process_node(state: State) -> State:
     messages = state.get("messages", [])
     messages.append("Processed!")
     return {"messages": messages}
+
 
 # Build the graph
 builder = StateGraph(State)

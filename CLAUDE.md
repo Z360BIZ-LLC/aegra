@@ -79,7 +79,8 @@ aegra/
 ### Run Execution Architecture
 - **Production mode** (`REDIS_BROKER_ENABLED=true`): Runs are dispatched via a Redis job queue (BLPOP). Workers run as concurrent asyncio tasks inside each instance (default: 3 workers x 10 jobs = 30 concurrent runs per instance). Lease-based crash recovery with heartbeat and reaper. Execution params stored in Postgres so workers can reconstruct jobs. OpenTelemetry trace context propagates across the Redis queue boundary.
 - **Dev mode** (`aegra dev`, `REDIS_BROKER_ENABLED=false`): Runs execute as in-process asyncio tasks via `LocalExecutor`. No Redis needed. SSE uses an in-memory broker.
-- Key files: `services/executor.py` (factory), `services/local_executor.py` (dev), `services/worker_executor.py` (prod), `services/lease_reaper.py` (crash recovery), `models/run_job.py` (serialized execution params).
+- **Per-org run limits** (`ORG_RUN_LIMIT_MODE=enforce`): caps concurrent runs per tenant across every graph. The gate lives on the `pending -> running` claim (org advisory lock + count derived from the runs table), so over-limit runs stay `pending` instead of being rejected; `RunPromoter` dispatches them as slots free. Off by default.
+- Key files: `services/executor.py` (factory), `services/local_executor.py` (dev), `services/worker_executor.py` (prod), `services/lease_reaper.py` (crash recovery), `services/run_limits.py` (per-org limits), `services/run_promoter.py` (queued-run dispatch), `models/run_job.py` (serialized execution params).
 - See `docs/guides/worker-architecture.mdx` for the full architecture documentation.
 
 ## Development Rules
@@ -97,6 +98,7 @@ aegra/
 def create_user(name: str, age: int) -> User: ...
 def process(items: list[str]) -> None: ...
 async def fetch(url: str) -> dict[str, Any]: ...
+
 
 # WRONG — missing return type, missing param types
 def create_user(name, age): ...
@@ -139,6 +141,7 @@ def get_user(user_id: str) -> User:
     except UserNotFoundError:
         raise HTTPException(status_code=404, detail="User not found")
 
+
 # WRONG — broad catch, swallowed exception, happy path buried
 def get_user(user_id):
     try:
@@ -159,13 +162,15 @@ def get_user(user_id):
 
 ```python
 # CORRECT — keyword-only args, immutable default
-def create_assistant(name: str, *, graph_id: str, config: dict | None = None, metadata: dict | None = None) -> Assistant:
+def create_assistant(
+    name: str, *, graph_id: str, config: dict | None = None, metadata: dict | None = None
+) -> Assistant:
     config = config or {}
     ...
 
+
 # WRONG — mutable default, too many positional args
-def create_assistant(name, graph_id, config={}, metadata={}, version=1, context={}):
-    ...
+def create_assistant(name, graph_id, config={}, metadata={}, version=1, context={}): ...
 ```
 
 ### Testing (STRICT)
@@ -276,6 +281,7 @@ graph = builder.compile()  # Must export as 'graph'
 **Factory function** (called per-request with user/config context):
 ```python
 from langgraph_sdk.runtime import ServerRuntime
+
 
 def graph(runtime: ServerRuntime):
     """Per-request factory — receives user, store, and access context."""

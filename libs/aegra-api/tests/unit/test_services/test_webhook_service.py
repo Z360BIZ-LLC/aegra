@@ -2,9 +2,56 @@
 
 from datetime import datetime
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from aegra_api.services.webhook_service import _promote_graph_created_at
+import pytest
+
+from aegra_api.services.webhook_service import WebhookService, _promote_graph_created_at
+
+
+class TestPayloadStatus:
+    """The webhook status must speak the same vocabulary as the runs API."""
+
+    @staticmethod
+    async def _captured_payload(status: str) -> dict:
+        service = WebhookService()
+        response = MagicMock()
+        response.status_code = 200
+        service.client = MagicMock()
+        service.client.post = AsyncMock(return_value=response)
+
+        await service.send_webhook(
+            webhook_url="https://app.example.test/hook",
+            run_id="run-1",
+            thread_id="thread-1",
+            status=status,
+            output={"messages": []},
+        )
+        return service.client.post.await_args.kwargs["json"]
+
+    @pytest.mark.parametrize("status", ["success", "error", "interrupted", "cancelled"])
+    async def test_status_is_forwarded_verbatim(self, status: str) -> None:
+        payload = await self._captured_payload(status)
+
+        assert payload["status"] == status
+
+    async def test_error_message_is_included(self) -> None:
+        service = WebhookService()
+        response = MagicMock()
+        response.status_code = 200
+        service.client = MagicMock()
+        service.client.post = AsyncMock(return_value=response)
+
+        await service.send_webhook(
+            webhook_url="https://app.example.test/hook",
+            run_id="run-1",
+            thread_id="thread-1",
+            status="error",
+            output={},
+            error_message="boom",
+        )
+
+        assert service.client.post.await_args.kwargs["json"]["error"] == "boom"
 
 
 class TestPromoteGraphCreatedAt:
