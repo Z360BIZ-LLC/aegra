@@ -73,13 +73,26 @@ class LangGraphAuthBackend(AuthenticationBackend):
 
     def __init__(self) -> None:
         self.auth_instance = self._load_auth_instance()
-        if self.auth_instance is None:
-            logger.warning(
-                "No auth file configured — all requests share a single 'anonymous' identity. "
-                "Data is NOT isolated between users in this mode. "
-                "Configure 'auth.path' in aegra.json before serving multiple users. "
-                "See: https://docs.aegra.dev/guides/authentication"
+        if self.auth_instance is not None:
+            return
+
+        # AUTH_TYPE=custom is a deployment asserting that auth is mandatory. An
+        # unloadable handler there is a deploy fault — a bad path, a file the
+        # image never copied — and falling back to a shared 'anonymous' identity
+        # would silently un-isolate every tenant. Refuse to serve instead.
+        if settings.app.AUTH_TYPE == "custom":
+            raise RuntimeError(
+                "AUTH_TYPE=custom but no auth handler could be loaded. Check "
+                "'auth.path' in aegra.json and that the file it names is present "
+                "in the image. Refusing to start with anonymous authentication."
             )
+
+        logger.warning(
+            "No auth file configured — all requests share a single 'anonymous' identity. "
+            "Data is NOT isolated between users in this mode. "
+            "Configure 'auth.path' in aegra.json before serving multiple users. "
+            "See: https://docs.aegra.dev/guides/authentication"
+        )
 
     def _load_auth_instance(self) -> Auth | None:
         """Load the auth instance from config or fallback to hardcoded candidates.
