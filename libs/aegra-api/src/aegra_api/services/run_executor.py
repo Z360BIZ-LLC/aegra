@@ -26,6 +26,7 @@ from aegra_api.services.langgraph_service import (
     create_thread_config,
     get_langgraph_service,
 )
+from aegra_api.services.run_limits import resolve_org_id
 from aegra_api.services.run_status import finalize_run, update_run_status
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_state_service import ThreadStateService
@@ -206,6 +207,9 @@ async def _send_run_webhook(
         status=status,
         output=output,
         error_message=error_message,
+        # Same resolution the run-limits gate uses, so the callback names the
+        # tenant the run was actually counted against.
+        org_id=resolve_org_id(job.config, job.run_metadata),
     )
 
 

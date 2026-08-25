@@ -22,9 +22,9 @@ from aegra_api.api.stateless_runs import router as stateless_runs_router
 from aegra_api.api.store import router as store_router
 from aegra_api.api.threads import router as threads_router
 from aegra_api.config import CorsConfig, HttpConfig, get_config_dir, load_http_config
-from aegra_api.core.auth_middleware import get_auth_backend
 from aegra_api.core.app_loader import load_custom_app
 from aegra_api.core.auth_deps import auth_dependency
+from aegra_api.core.auth_middleware import get_auth_backend
 from aegra_api.core.database import db_manager
 from aegra_api.core.health import router as health_router
 from aegra_api.core.migrations import run_migrations_async
