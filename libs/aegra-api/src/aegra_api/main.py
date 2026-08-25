@@ -22,6 +22,7 @@ from aegra_api.api.stateless_runs import router as stateless_runs_router
 from aegra_api.api.store import router as store_router
 from aegra_api.api.threads import router as threads_router
 from aegra_api.config import CorsConfig, HttpConfig, get_config_dir, load_http_config
+from aegra_api.core.auth_middleware import get_auth_backend
 from aegra_api.core.app_loader import load_custom_app
 from aegra_api.core.auth_deps import auth_dependency
 from aegra_api.core.database import db_manager
@@ -133,6 +134,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     except (ConnectionRefusedError, OSError) as e:
         _log_connection_help(e)
         raise
+
+    # Resolve the auth backend now rather than on the first request, so an
+    # AUTH_TYPE=custom deployment whose handler will not load fails the
+    # healthcheck instead of serving anonymously until someone notices.
+    get_auth_backend()
 
     # Observability
     setup_observability()

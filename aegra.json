@@ -1,4 +1,7 @@
 {
+  "auth": {
+    "path": "./src/auth.py:auth"
+  },
   "graphs": {
     "slow_agent": "./src/text_agent/graph.py:graph",
     "slow_ability_engine": "./src/text_agent/ability_engine/engine.py:graph",
