@@ -156,6 +156,7 @@ class RunPromoter:
             status="error",
             output={},
             error_message=_QUEUE_EXPIRY_ERROR,
+            org_id=expired.org_id,
         )
 
 

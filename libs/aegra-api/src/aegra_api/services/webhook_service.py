@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import structlog
+from app_sdk.credentials import authorization_header
 from observability.cloudwatch_emf import emit_metric
 
 from aegra_api.core.serializers import GeneralSerializer
@@ -114,6 +115,33 @@ class WebhookService:
             await self.client.aclose()
             self.client = None
 
+    @staticmethod
+    def _headers(run_id: str, thread_id: str, org_id: str | None) -> dict[str, str]:
+        """Callback headers, including the credential the app now requires.
+
+        Minted here rather than captured at run creation: the token lives five
+        minutes and a run can take longer, so a token taken at creation would
+        routinely be expired by the time its own completion webhook fired.
+
+        Same credential the AppSDK presents on the agent API — the app verifies
+        one token shape on both surfaces (Z360 HIPAA-011). A run whose tenant we
+        cannot name still sends; the app decides whether to accept it, and
+        failing the callback here would lose the run result entirely.
+        """
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Aegra-Webhook/1.0",
+            "X-Aegra-Event": "run.completed",
+            "X-Aegra-Run-ID": run_id,
+            "X-Aegra-Thread-ID": thread_id,
+        }
+        if not org_id:
+            logger.warning(f"[webhook] No org_id for run_id={run_id}; callback will be unscoped")
+        authorization = authorization_header(org_id)
+        if authorization:
+            headers["Authorization"] = authorization
+        return headers
+
     async def send_webhook(
         self,
         webhook_url: str,
@@ -123,6 +151,7 @@ class WebhookService:
         output: dict[str, Any] | None = None,
         error_message: str | None = None,
         max_retries: int = 3,
+        org_id: str | None = None,
     ) -> bool:
         """
         Send webhook callback for run completion.
@@ -138,6 +167,9 @@ class WebhookService:
             output: Run output data (empty on the error and cancel paths)
             error_message: Error message (if failed)
             max_retries: Number of retry attempts
+            org_id: Organisation the run belongs to. Names the tenant in the
+                callback credential; without it the app rejects the token on
+                its org-scoped webhook routes.
 
         Returns:
             bool: True if webhook was delivered successfully, False otherwise
@@ -188,13 +220,7 @@ class WebhookService:
                 response = await client.post(
                     webhook_url,
                     json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "Aegra-Webhook/1.0",
-                        "X-Aegra-Event": "run.completed",
-                        "X-Aegra-Run-ID": run_id,
-                        "X-Aegra-Thread-ID": thread_id,
-                    },
+                    headers=self._headers(run_id, thread_id, org_id),
                 )
 
                 if response.status_code in (200, 201, 202, 204):
@@ -304,6 +330,7 @@ async def send_run_webhook(
     status: str,
     output: dict[str, Any] | None = None,
     error_message: str | None = None,
+    org_id: str | None = None,
 ) -> None:
     """
     Convenience function to send run completion webhook.
@@ -319,6 +346,7 @@ async def send_run_webhook(
                 status=status,
                 output=output,
                 error_message=error_message,
+                org_id=org_id,
             )
         )
         _inflight_webhook_tasks.add(task)
