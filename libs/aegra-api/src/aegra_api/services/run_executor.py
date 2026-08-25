@@ -209,7 +209,7 @@ async def _send_run_webhook(
         error_message=error_message,
         # Same resolution the run-limits gate uses, so the callback names the
         # tenant the run was actually counted against.
-        org_id=resolve_org_id(job.config, job.run_metadata),
+        org_id=resolve_org_id(job.execution.config, job.run_metadata),
     )
 
 
