@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 
 import redis.asyncio as aioredis
 import structlog
+from helpers.redis_url import redis_credentials_configured, redis_url_with_credentials
 
 from aegra_api.settings import settings
 
@@ -26,10 +27,19 @@ class RedisManager:
         if self._client is not None:
             return
 
+        # HIPAA-024: the beta cache is moving to an ElastiCache RBAC user group.
+        # REDIS_URL is the credential-free CloudFormation export, so the RBAC
+        # username and password arrive separately as REDIS_SECRET and are
+        # injected here. A no-op wherever REDIS_SECRET is unset -- local dev,
+        # docker-compose, and beta between the credential being created and
+        # the user group being attached -- which is exactly what lets this
+        # deploy before the cache starts demanding it.
+        authenticated_url = redis_url_with_credentials(settings.redis.REDIS_URL)
+
         # health_check_interval keeps pooled connections alive across long BLPOP
         # idles so the next blocking call doesn't raise on a half-closed socket.
         self._pool = aioredis.ConnectionPool.from_url(
-            settings.redis.REDIS_URL,
+            authenticated_url,
             max_connections=settings.redis.REDIS_MAX_CONNECTIONS,
             decode_responses=True,
             socket_keepalive=True,
@@ -38,9 +48,17 @@ class RedisManager:
         self._client = aioredis.Redis(connection_pool=self._pool)
 
         await self._client.ping()  # type: ignore[invalid-await]  # redis.asyncio stubs
-        # Log only host info, not full URL which may contain credentials
+        # Log only host info, not full URL which may contain credentials.
+        # Parse the ORIGINAL setting, not authenticated_url -- that one now
+        # carries a password. `authenticated` records which side of the
+        # HIPAA-024 rollout this process is on without printing anything.
         parsed = urlparse(settings.redis.REDIS_URL)
-        logger.info("Redis broker initialized", host=parsed.hostname, port=parsed.port)
+        logger.info(
+            "Redis broker initialized",
+            host=parsed.hostname,
+            port=parsed.port,
+            authenticated=redis_credentials_configured(),
+        )
 
     async def close(self) -> None:
         """Close Redis connection pool."""
