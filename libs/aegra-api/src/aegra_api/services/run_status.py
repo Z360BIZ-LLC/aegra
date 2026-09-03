@@ -6,6 +6,7 @@ worker_executor). Extracted from api/runs.py to eliminate the circular
 dependency where service code imported from the API module.
 """
 
+import json
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -122,12 +123,24 @@ async def finalize_run(
 
 
 def _safe_serialize(output: Any, run_id: str) -> Any:
-    """Serialize output with a fallback for non-JSON-compatible objects."""
+    """Serialize output with a fallback for non-JSON-compatible objects.
+
+    The result is round-tripped through ``json.dumps`` before it is returned.
+    ``output`` columns are JSONB, so the driver json-encodes whatever it is
+    handed at execute() time: a value the serializer let through un-encoded
+    would raise *inside* the finalize_run transaction, past this fallback,
+    aborting the thread-status and interrupts writes batched alongside it and
+    losing an interrupted thread's resume point. Failing here instead costs
+    only the output blob, which is a reporting copy — the authoritative state
+    is the checkpoint.
+    """
     try:
-        return _serializer.serialize(output)
+        serialized = _serializer.serialize(output)
+        json.dumps(serialized)
     except Exception as exc:
         logger.warning("Output serialization failed", run_id=run_id, error=str(exc))
         return {
             "error": "Output serialization failed",
             "original_type": str(type(output)),
         }
+    return serialized

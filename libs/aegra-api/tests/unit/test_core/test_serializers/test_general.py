@@ -1,5 +1,7 @@
 """Unit tests for serializers"""
 
+import base64
+import json
 from collections import namedtuple
 
 import pytest
@@ -28,6 +30,13 @@ class PydanticV1Style:
         return {"name": self.name, "value": self.value}
 
 
+class PydanticV1StyleWithBytes:
+    """Pydantic v1 style object whose .dict() hides bytes one level down"""
+
+    def dict(self):
+        return {"blob": b"raw"}
+
+
 class InterruptMock:
     """Mock LangGraph Interrupt object"""
 
@@ -41,6 +50,85 @@ class InterruptMock:
             __name__ = "Interrupt"
 
         return MockClass()
+
+
+class TestGeneralSerializerBinaryAndNesting:
+    """Regression tests: the serializer's output must survive json.dumps().
+
+    A JSONB column is json.dumps()'d by the driver at execute() time, so
+    anything the serializer lets through un-encoded raises inside the caller's
+    transaction rather than here.
+    """
+
+    def setup_method(self):
+        self.serializer = GeneralSerializer()
+
+    def test_bytes_are_base64_encoded(self):
+        """Raw bytes are base64'd rather than left for json.dumps to reject."""
+        result = self.serializer.serialize(b"binary\x00data")
+
+        assert result == base64.b64encode(b"binary\x00data").decode("ascii")
+        json.dumps(result)
+
+    @pytest.mark.parametrize("blob", [bytearray(b"ba"), memoryview(b"mv")])
+    def test_bytes_like_are_base64_encoded(self, blob):
+        """bytearray/memoryview are json-hostile in the same way bytes are."""
+        result = self.serializer.serialize(blob)
+
+        assert result == base64.b64encode(bytes(blob)).decode("ascii")
+        json.dumps(result)
+
+    def test_bytes_nested_in_model_dump_are_encoded(self):
+        """The real failure: bytes nested inside a Pydantic model's dump.
+
+        Reasoning models return encrypted chain-of-thought as bytes
+        (Bedrock's `reasoningContent.redactedContent`), which lands nested in
+        an AIMessage content block - not at the top level, where a
+        non-recursive model_dump() left it un-encoded.
+        """
+
+        class Message(BaseModel):
+            content: list[dict]
+
+        message = Message(content=[{"reasoning": {"redacted_content": b"rsn_secret"}}])
+
+        result = self.serializer.serialize(message)
+
+        assert result["content"][0]["reasoning"]["redacted_content"] == (
+            base64.b64encode(b"rsn_secret").decode("ascii")
+        )
+        json.dumps(result)
+
+    def test_bytes_nested_in_v1_dict_are_encoded(self):
+        """Same recursion gap on the Pydantic-v1 style `.dict()` branch."""
+        result = self.serializer.serialize(PydanticV1StyleWithBytes())
+
+        assert result["blob"] == base64.b64encode(b"raw").decode("ascii")
+        json.dumps(result)
+
+    def test_non_string_mapping_keys_are_coerced(self):
+        """json.dumps rejects a tuple key exactly like it rejects bytes."""
+        result = self.serializer.serialize({("a", "b"): 1, b"k": 2, "s": 3, 4: 5})
+
+        json.dumps(result)
+        assert result["s"] == 3
+        assert result[base64.b64encode(b"k").decode("ascii")] == 2
+
+    def test_sets_are_serialized_elementwise(self):
+        """Set members go through the same coercion as list items."""
+        result = self.serializer.serialize({b"x"})
+
+        assert result == [base64.b64encode(b"x").decode("ascii")]
+        json.dumps(result)
+
+    def test_self_referencing_dump_terminates(self):
+        """A model whose dump contains itself must not recurse forever."""
+
+        class SelfRef:
+            def model_dump(self):
+                return {"inner": self}
+
+        json.dumps(self.serializer.serialize(SelfRef()))
 
 
 class TestGeneralSerializer:
