@@ -6,7 +6,6 @@
     "slow_agent": "./src/text_agent/graph.py:graph",
     "slow_ability_engine": "./src/text_agent/ability_engine/engine.py:graph",
     "sales_agent": "./src/sales_agent/graph.py:graph",
-    "evaluator_agent": "./src/evaluator_agent/graph.py:graph",
     "ability_testing_agent": "./src/ability_testing_agent/graph.py:graph",
     "deep_agent": "./src/deep_agent/agent.py:graph"
   }
