@@ -5,7 +5,7 @@ from functools import lru_cache
 from typing import Annotated
 from urllib.parse import parse_qsl, quote_plus, urlencode
 
-from pydantic import BeforeValidator, computed_field, model_validator
+from pydantic import BeforeValidator, Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from aegra_api import __version__
@@ -98,6 +98,8 @@ class AppSettings(EnvBase):
     AUTH_TYPE: LowerStr = "noop"
     ENV_MODE: UpperStr = "LOCAL"
     DEBUG: bool = False
+    # Default 1000 matches LangGraph Platform threads.search (Agent Server OpenAPI max).
+    MAX_SEARCH_LIMIT: int = Field(default=1000, ge=1)
 
     # Run alembic upgrade head on startup. Default True (dev / single-pod).
     # Set False for multi-pod K8s to avoid advisory-lock probe timeouts;
@@ -365,6 +367,12 @@ class RedisSettings(EnvBase):
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_CHANNEL_PREFIX: str = "aegra:run:"
     REDIS_MAX_CONNECTIONS: int = 250
+    # PING pooled connections idle longer than this (seconds) before reuse, so
+    # server-side idle disconnects don't surface as ConnectionError. 0 disables.
+    REDIS_HEALTH_CHECK_INTERVAL: int = Field(default=30, ge=0)
+    # Non-negative retries after the initial attempt (up to 4 calls total) on
+    # connection and timeout errors, with exponential backoff 50ms..1s.
+    REDIS_RETRY_ATTEMPTS: int = Field(default=3, ge=0)
 
 
 class WorkerSettings(EnvBase):
@@ -539,6 +547,21 @@ class RunLimitSettings(EnvBase):
         return self
 
 
+class ThreadTTLSettings(EnvBase):
+    """Thread TTL sweeper configuration.
+
+    AEGRA_THREAD_TTL is either a bare number (default_ttl in minutes) or a
+    JSON object with any of: strategy, default_ttl, sweep_interval_minutes,
+    sweep_limit. When set it replaces the aegra.json checkpointer.ttl block
+    entirely. LANGGRAPH_THREAD_TTL is accepted as a fallback alias so env
+    files migrated from LangGraph Platform work unchanged; AEGRA_THREAD_TTL
+    wins when both are set. Parsed and validated in services.thread_ttl.
+    """
+
+    AEGRA_THREAD_TTL: str | None = None
+    LANGGRAPH_THREAD_TTL: str | None = None
+
+
 class EventStreamingSettings(EnvBase):
     """Agent Protocol v2 event streaming (/threads/{id}/stream/events + /commands).
 
@@ -565,6 +588,7 @@ class Settings:
         self.worker = WorkerSettings()
         self.cron = CronSettings()
         self.run_limits = RunLimitSettings()
+        self.thread_ttl = ThreadTTLSettings()
         self.event_streaming = EventStreamingSettings()
 
 

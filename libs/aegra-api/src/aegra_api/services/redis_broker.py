@@ -13,15 +13,16 @@ import contextlib
 import json
 import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import structlog
 from redis import RedisError
 
-from aegra_api.core.active_runs import active_runs
+from aegra_api.core.active_runs import active_runs, explicit_run_cancellations
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.core.serializers import GeneralSerializer
+from aegra_api.models.enums import RunCancellationAction
 from aegra_api.services.base_broker import BaseBrokerManager, BaseRunBroker
 from aegra_api.settings import settings
 from aegra_api.utils import generate_event_id
@@ -41,6 +42,12 @@ _REPLAY_MAX_EVENTS = 10_000
 _BACKOFF_BASE = 0.5
 _BACKOFF_MAX = 30.0
 _BACKOFF_FACTOR = 2.0
+
+# Bounded retry for the write path (put). The read path (aiter) retries
+# RedisError indefinitely; the write path must be bounded so a producer can't
+# block forever, but it should still retry a transient blip rather than drop the
+# event — a dropped event is a permanently lost SSE token.
+_PUT_MAX_ATTEMPTS = 3
 
 
 def _serialize_payload(payload: Any) -> str:
@@ -80,8 +87,21 @@ class RedisRunBroker(BaseRunBroker):
         self._cache_key = cache_key
         self._counter_key = counter_key
         self._finished = False
+        # Serializes writes for this run so concurrent put() calls (e.g. a
+        # cancel/error signal racing a stream write) keep cache-then-publish
+        # ordering — without it, a backoff sleep on one put could let a later
+        # event's publish overtake an earlier one.
+        self._write_lock = asyncio.Lock()
 
     async def put(self, event_id: str, payload: Any, *, resumable: bool = True) -> None:
+        """Append an event to the replay buffer and publish it to live subscribers.
+
+        Writes are retried with bounded backoff (see ``_write_with_retry``), so
+        delivery is **at-least-once**: in the rare case a write times out *after*
+        Redis already applied it, a retry may re-deliver the event. ``event_id``
+        is stable (allocated once upstream), so consumers de-duplicate on
+        ``Last-Event-ID`` during replay.
+        """
         if self._finished:
             logger.warning(f"Attempted to put event {event_id} into finished broker for run {self.run_id}")
             return
@@ -95,28 +115,68 @@ class RedisRunBroker(BaseRunBroker):
 
         is_end = isinstance(payload, tuple) and len(payload) >= 1 and payload[0] == "end"
 
-        try:
-            client = redis_manager.get_client()
+        async with self._write_lock:
+            # Cache and publish are retried independently so a publish failure
+            # never re-runs the cache pipeline (which would double-write the
+            # replay buffer and double-increment the sequence counter).
+            operation = "cache"
+            try:
+                if resumable:
+                    await self._write_with_retry(self._cache_event, message)
 
-            if resumable:
-                pipe = client.pipeline()
-                pipe.rpush(self._cache_key, message)
-                pipe.ltrim(self._cache_key, -_REPLAY_MAX_EVENTS, -1)
-                pipe.expire(self._cache_key, _REPLAY_TTL_SECONDS)
-                pipe.incr(self._counter_key)
-                pipe.expire(self._counter_key, _REPLAY_TTL_SECONDS)
-                await pipe.execute()  # type: ignore[invalid-await]
+                operation = "publish"
+                await self._write_with_retry(self._publish_event, message)
 
-            await client.publish(self._channel, message)
+                if is_end:
+                    self._finished = True
+            except RedisError as e:
+                logger.error(
+                    f"Redis {operation} write failed for run {self.run_id} after {_PUT_MAX_ATTEMPTS} attempts: {e}"
+                )
+                # Even if Redis fails, mark finished for end events so aiter() can exit
+                # rather than looping forever waiting for an end event that won't arrive.
+                if is_end:
+                    self._finished = True
 
-            if is_end:
-                self._finished = True
-        except RedisError as e:
-            logger.error(f"Redis publish failed for run {self.run_id}: {e}")
-            # Even if Redis fails, mark finished for end events so aiter() can exit
-            # rather than looping forever waiting for an end event that won't arrive.
-            if is_end:
-                self._finished = True
+    async def _cache_event(self, message: str) -> None:
+        """Append the event to the replay buffer and bump the sequence counter."""
+        client = redis_manager.get_client()
+        pipe = client.pipeline()
+        pipe.rpush(self._cache_key, message)
+        pipe.ltrim(self._cache_key, -_REPLAY_MAX_EVENTS, -1)
+        pipe.expire(self._cache_key, _REPLAY_TTL_SECONDS)
+        pipe.incr(self._counter_key)
+        pipe.expire(self._counter_key, _REPLAY_TTL_SECONDS)
+        await pipe.execute()
+
+    async def _publish_event(self, message: str) -> None:
+        """Broadcast the event to live subscribers."""
+        client = redis_manager.get_client()
+        await client.publish(self._channel, message)
+
+    async def _write_with_retry(self, op: Callable[[str], Awaitable[None]], message: str) -> None:
+        """Run a Redis write with bounded exponential backoff.
+
+        Mirrors the retry/backoff the read path (aiter) already applies, so a
+        transient client-side blip (e.g. socket timeout) is retried instead of
+        dropping the event. Bounded by ``_PUT_MAX_ATTEMPTS`` so a producer never
+        blocks indefinitely; the final ``RedisError`` propagates to ``put()``.
+        """
+        attempt = 0
+        while True:
+            try:
+                await op(message)
+                return
+            except RedisError as e:
+                attempt += 1
+                if attempt >= _PUT_MAX_ATTEMPTS:
+                    raise
+                delay = _backoff_delay(attempt)
+                logger.warning(
+                    f"Redis write failed for run {self.run_id}, retrying in {delay:.1f}s: {e}",
+                    attempt=attempt,
+                )
+                await asyncio.sleep(delay)
 
     async def aiter(self) -> AsyncIterator[tuple[str, Any]]:
         attempt = 0
@@ -146,6 +206,7 @@ class RedisRunBroker(BaseRunBroker):
         # the end event was published before we subscribed on this instance).
         end_already_in_buffer = await self._check_end_in_buffer()
 
+        last_yielded_event_id: str | None = None
         try:
             while True:
                 message = await pubsub.get_message(
@@ -162,6 +223,15 @@ class RedisRunBroker(BaseRunBroker):
 
                 data = json.loads(message["data"])
                 event_id: str = data["event_id"]
+
+                # Drop an at-least-once republish (put() retries a transient
+                # publish failure). event_ids are unique per event and the write
+                # lock keeps a retry adjacent, so skipping a repeat of the last
+                # id de-duplicates without dropping a distinct event.
+                if event_id == last_yielded_event_id:
+                    continue
+                last_yielded_event_id = event_id
+
                 payload = _deserialize_payload(data["payload"])
 
                 yield event_id, payload
@@ -206,9 +276,20 @@ class RedisRunBroker(BaseRunBroker):
         all_events: list[tuple[str, Any]] = []
         events_after: list[tuple[str, Any]] = []
         found_last = last_event_id is None
+        prev_event_id: str | None = None
         for raw in raw_messages:
             data = json.loads(raw)
             event_id: str = data["event_id"]
+
+            # Skip an adjacent duplicate: put() retries are at-least-once, so a
+            # write that timed out *after* Redis applied it can RPUSH the same
+            # event twice. The per-run write lock keeps the copies adjacent, and
+            # event_ids are unique per event, so dropping a run of equal ids is
+            # safe and removes the duplicate from replay.
+            if event_id == prev_event_id:
+                continue
+            prev_event_id = event_id
+
             payload = _deserialize_payload(data["payload"])
             all_events.append((event_id, payload))
 
@@ -295,24 +376,36 @@ class RedisBrokerManager(BaseBrokerManager):
             self._listener_task = None
         logger.debug("Redis broker manager stopped")
 
-    async def request_cancel(self, run_id: str, action: str = "cancel") -> None:
+    async def request_cancel(
+        self,
+        run_id: str,
+        action: RunCancellationAction = "cancel",
+        *,
+        emit_end_event: bool = True,
+    ) -> None:
         """Broadcast a cancel command via Redis pub/sub."""
-        message = json.dumps({"run_id": run_id, "action": action})
+        message = json.dumps(
+            {
+                "run_id": run_id,
+                "action": action,
+                "emit_end_event": emit_end_event,
+            }
+        )
         try:
             client = redis_manager.get_client()
             await client.publish(self._cancel_channel, message)
             logger.info(f"Published {action} command for run {run_id}")
         except RedisError as e:
             logger.error(f"Failed to publish {action} for run {run_id}: {e}")
-            # Fall back to local execution — if the task is on this instance,
+            # Fall back to local execution - if the task is on this instance,
             # we can still cancel it even if Redis publish fails.
-            await self._execute_cancel(run_id)
+            await self._execute_cancel(run_id, emit_end_event=emit_end_event)
 
     async def get_event_sequence(self, run_id: str) -> int:
         """Read the current event sequence counter from Redis (O(1) GET)."""
         try:
             client = redis_manager.get_client()
-            value = await client.get(f"{self._counter_prefix}{run_id}")  # type: ignore[invalid-await]
+            value = await client.get(f"{self._counter_prefix}{run_id}")
             if value is not None:
                 return int(value)
         except (RedisError, ValueError) as e:
@@ -329,8 +422,8 @@ class RedisBrokerManager(BaseBrokerManager):
         counter_key = f"{self._counter_prefix}{run_id}"
         try:
             client = redis_manager.get_client()
-            seq = await client.incr(counter_key)  # type: ignore[invalid-await]
-            await client.expire(counter_key, _REPLAY_TTL_SECONDS)  # type: ignore[invalid-await]
+            seq = await client.incr(counter_key)
+            await client.expire(counter_key, _REPLAY_TTL_SECONDS)
             return generate_event_id(run_id, int(seq))
         except RedisError as e:
             logger.warning(f"Failed to allocate event_id for run {run_id}: {e}")
@@ -374,27 +467,31 @@ class RedisBrokerManager(BaseBrokerManager):
 
                 try:
                     data = json.loads(message["data"])
-                    await self._execute_cancel(data["run_id"])
-                except (json.JSONDecodeError, KeyError) as e:
+                    emit_end_event = data.get("emit_end_event", True)
+                    if not isinstance(emit_end_event, bool):
+                        raise ValueError("emit_end_event must be a boolean")
+                    await self._execute_cancel(data["run_id"], emit_end_event=emit_end_event)
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
                     logger.warning(f"Invalid cancel message: {e}")
         finally:
             await pubsub.unsubscribe(self._cancel_channel)
             await pubsub.aclose()
 
-    async def _execute_cancel(self, run_id: str) -> None:
+    async def _execute_cancel(self, run_id: str, *, emit_end_event: bool = True) -> None:
         """Cancel a locally-owned task and signal the broker."""
         task = active_runs.get(run_id)
         if task is None or task.done():
             return
 
         logger.info(f"Cancelling run {run_id} (local task found)")
+        explicit_run_cancellations.add(run_id)
         task.cancel()
 
         broker = self.get_or_create_broker(run_id)
-        if not broker.is_finished():
+        if emit_end_event and not broker.is_finished():
             event_id = await self.allocate_event_id(run_id)
             await broker.put(event_id, ("end", {"status": "interrupted"}))
-            # Do NOT call cleanup_broker here — execute_run's finally block
+            # Do NOT call cleanup_broker here - execute_run's finally block
             # owns cleanup.  Leaving the finished broker in _brokers lets
             # signal_run_cancelled see is_finished() → True and skip the
             # duplicate end event.
