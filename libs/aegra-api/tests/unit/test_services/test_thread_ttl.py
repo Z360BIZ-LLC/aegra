@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langgraph.checkpoint.base import CheckpointMetadata
 from langgraph.checkpoint.postgres.base import MIGRATIONS, SELECT_SQL
 from psycopg import Error as PsycopgError
 from pydantic import ValidationError
@@ -33,11 +34,13 @@ def _swept_count(outcome: str) -> float:
 def _make_lg_pool() -> tuple[MagicMock, AsyncMock]:
     """Fake db_manager.lg_pool: connection() and transaction() async CMs.
 
-    The prunable-history probe answers True by default; override
+    The probe answers prunable=True / delta=False by default; override
     conn.execute.return_value.fetchone for the skip path.
     """
     conn = AsyncMock()
-    conn.execute.return_value.fetchone = AsyncMock(return_value={"has_prunable_history": True})
+    conn.execute.return_value.fetchone = AsyncMock(
+        return_value={"has_prunable_history": True, "uses_delta_channels": False}
+    )
     tx = AsyncMock()
     tx.__aenter__ = AsyncMock(return_value=None)
     tx.__aexit__ = AsyncMock(return_value=False)
@@ -296,7 +299,7 @@ class TestKeepLatest:
         assert outcome == "pruned"
         statements = [call.args[0] for call in conn.execute.await_args_list]
         assert len(statements) == 4
-        assert "SELECT EXISTS" in statements[0]  # prunable-history probe first
+        assert "has_prunable_history" in statements[0]  # probe first
         assert "DELETE FROM checkpoints" in statements[1]
         assert "DELETE FROM checkpoint_writes" in statements[2]
         assert "DELETE FROM checkpoint_blobs" in statements[3]
@@ -312,7 +315,9 @@ class TestKeepLatest:
     async def test_skips_deletes_when_history_already_compact(self) -> None:
         """Idle expiry cycles cost one PK-indexed probe, not three DELETEs."""
         pool, conn = _make_lg_pool()
-        conn.execute.return_value.fetchone = AsyncMock(return_value={"has_prunable_history": False})
+        conn.execute.return_value.fetchone = AsyncMock(
+            return_value={"has_prunable_history": False, "uses_delta_channels": False}
+        )
         db = MagicMock()
         db.lg_pool = pool
         session = AsyncMock()
@@ -328,6 +333,49 @@ class TestKeepLatest:
         # Still re-arms so the next cycle stays scheduled
         rearm_sql = str(session.execute.await_args_list[0].args[0].compile(dialect=postgresql.dialect()))
         assert "UPDATE thread_ttl" in rearm_sql
+
+    @pytest.mark.asyncio
+    async def test_delta_backed_thread_is_never_pruned(self) -> None:
+        """A DeltaChannel value is reconstructed by walking the parent chain to
+        its last _DeltaSnapshot. Dropping intermediate checkpoints severs that
+        chain and the channel reads back EMPTY with no error raised, so the
+        prune must not run at all."""
+        pool, conn = _make_lg_pool()
+        conn.execute.return_value.fetchone = AsyncMock(
+            return_value={"has_prunable_history": True, "uses_delta_channels": True}
+        )
+        db = MagicMock()
+        db.lg_pool = pool
+        session = AsyncMock()
+
+        with patch("aegra_api.services.thread_ttl.db_manager", db):
+            outcome = await _apply_strategy(
+                session, thread_id="t-1", strategy="keep_latest", ttl_minutes=30.0, now=datetime.now(UTC)
+            )
+
+        assert outcome == "skipped_delta"
+        assert conn.execute.await_count == 1  # probe only, no DELETEs
+        conn.transaction.assert_not_called()
+        # Still re-arms, so the thread is not re-examined every tick
+        rearm_sql = str(session.execute.await_args_list[0].args[0].compile(dialect=postgresql.dialect()))
+        assert "UPDATE thread_ttl" in rearm_sql
+
+    @pytest.mark.asyncio
+    async def test_probe_detects_delta_channels_via_checkpoint_metadata(self) -> None:
+        """The probe keys on langgraph's own marker, not a heuristic."""
+        pool, conn = _make_lg_pool()
+        db = MagicMock()
+        db.lg_pool = pool
+        session = AsyncMock()
+
+        with patch("aegra_api.services.thread_ttl.db_manager", db):
+            await _apply_strategy(
+                session, thread_id="t-1", strategy="keep_latest", ttl_minutes=30.0, now=datetime.now(UTC)
+            )
+
+        probe = conn.execute.await_args_list[0].args[0]
+        assert "uses_delta_channels" in probe
+        assert "jsonb_exists(metadata, 'counters_since_delta_snapshot')" in probe
 
     @pytest.mark.asyncio
     async def test_raises_when_db_not_initialized(self) -> None:
@@ -361,7 +409,9 @@ class TestFailureIsolation:
 
         errors_before = _swept_count("error")
         with patch("aegra_api.services.thread_ttl.db_manager", db):
-            claimed, deleted, pruned, failed_ids = await _process_expired_batch(session, MagicMock(), datetime.now(UTC))
+            claimed, deleted, pruned, skipped, failed_ids = await _process_expired_batch(
+                session, MagicMock(), datetime.now(UTC)
+            )
 
         assert (claimed, deleted, pruned) == (2, 1, 0)
         assert failed_ids == ["t-1"]
@@ -376,7 +426,9 @@ class TestFailureIsolation:
         session = AsyncMock()
         session.execute.return_value = claim_result
 
-        claimed, deleted, pruned, failed_ids = await _process_expired_batch(session, MagicMock(), datetime.now(UTC))
+        claimed, deleted, pruned, skipped, failed_ids = await _process_expired_batch(
+            session, MagicMock(), datetime.now(UTC)
+        )
 
         assert (claimed, deleted, pruned, failed_ids) == (0, 0, 0, [])
         session.commit.assert_not_awaited()
@@ -396,7 +448,7 @@ class TestSweepLimit:
         maker.return_value.__aenter__ = AsyncMock(return_value=session)
         maker.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        batches = [(100, 100, 0, []), (100, 100, 0, []), (50, 50, 0, []), (0, 0, 0, [])]
+        batches = [(100, 100, 0, 0, []), (100, 100, 0, 0, []), (50, 50, 0, 0, []), (0, 0, 0, 0, [])]
         with (
             patch("aegra_api.services.thread_ttl._get_session_maker", return_value=maker),
             patch(
@@ -424,7 +476,7 @@ class TestSweepLimit:
         maker.return_value.__aenter__ = AsyncMock(return_value=session)
         maker.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        batches = [(2, 1, 0, ["bad-1"]), (1, 1, 0, []), (0, 0, 0, [])]
+        batches = [(2, 1, 0, 0, ["bad-1"]), (1, 1, 0, 0, []), (0, 0, 0, 0, [])]
         with (
             patch("aegra_api.services.thread_ttl._get_session_maker", return_value=maker),
             patch(
@@ -520,9 +572,17 @@ class TestSchemaCanary:
         assert "PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)" in ddl
         assert "PRIMARY KEY (thread_id, checkpoint_ns, channel, version)" in ddl
         assert "PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)" in ddl
+        assert "metadata JSONB NOT NULL" in ddl
         # keep_latest keeps exactly the blob versions the latest checkpoint
         # references — the same join langgraph's reader performs.
         assert "jsonb_each_text(checkpoint -> 'channel_versions')" in SELECT_SQL
+
+    def test_delta_channel_marker_still_exists(self) -> None:
+        """The keep_latest guard detects delta-backed threads by the presence of
+        this CheckpointMetadata key. It is beta and langgraph says the name may
+        change — if it does, the guard silently stops guarding and deep-agent
+        conversations get emptied. Fail here instead."""
+        assert "counters_since_delta_snapshot" in CheckpointMetadata.__annotations__
 
 
 class TestPruneForUser:
@@ -533,15 +593,15 @@ class TestPruneForUser:
         monkeypatch.setattr("aegra_api.services.thread_ttl.get_thread_ttl_config", lambda: None)
         session = AsyncMock()
 
-        batches = [(2, 1, 1, ["bad-1"]), (1, 1, 0, []), (0, 0, 0, [])]
+        batches = [(2, 1, 1, 0, ["bad-1"]), (1, 1, 0, 1, []), (0, 0, 0, 0, [])]
         with patch(
             "aegra_api.services.thread_ttl._process_expired_batch",
             new_callable=AsyncMock,
             side_effect=batches,
         ) as mock_batch:
-            deleted, pruned = await prune_expired_threads_for_user(session, user_id="user-1")
+            deleted, pruned, skipped = await prune_expired_threads_for_user(session, user_id="user-1")
 
-        assert (deleted, pruned) == (2, 1)
+        assert (deleted, pruned, skipped) == (2, 1, 1)
         assert mock_batch.await_count == 3
         claim_sql = str(mock_batch.await_args_list[0].args[1].compile(dialect=postgresql.dialect()))
         assert "thread.user_id" in claim_sql

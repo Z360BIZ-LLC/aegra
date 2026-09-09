@@ -44,7 +44,13 @@ Create Date: 2026-06-12 00:00:00.000000
 from alembic import op
 
 revision = "b88bb61be638"
-down_revision = "c7d1f2a4b6e8"
+# Re-pointed from upstream's "c7d1f2a4b6e8" onto the fork's head. Upstream
+# branched this revision off cron_cascade_and_claim, which is also where the
+# fork's own chain branches, so merging upstream produced two alembic heads and
+# migrations refused to run at all ("Multiple head revisions are present").
+# Safe to re-point: this revision arrived with that merge and has never been
+# applied in any environment.
+down_revision = "c6d7e8f9a0b1"
 branch_labels = None
 depends_on = None
 

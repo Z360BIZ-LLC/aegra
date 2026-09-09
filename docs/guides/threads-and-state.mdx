@@ -237,6 +237,17 @@ A background sweep then applies each thread's policy:
 - `keep_latest` — checkpoint history is compacted down to the latest state; the
   thread stays usable and the TTL re-arms, so history is pruned periodically.
 
+<Warning>
+`keep_latest` skips threads whose graph uses a LangGraph `DeltaChannel`. Such a
+channel stores a sentinel per step plus a `_DeltaSnapshot` blob every
+`snapshot_frequency` updates, and its value is reconstructed by walking the
+parent chain back to that snapshot. Dropping the intermediate checkpoints severs
+the chain and the channel reconstructs as **empty, with no error raised** — so
+the sweep leaves those threads alone and counts them under `skipped`. If your
+agent is built on `deepagents`, its `messages` channel is a `DeltaChannel` and
+its threads will never be compacted.
+</Warning>
+
 Individual threads can override the default at creation:
 
 ```python
@@ -253,7 +264,7 @@ Expired threads can also be cleaned up immediately for the calling user:
 import httpx
 
 resp = httpx.post("http://localhost:2026/threads/prune")
-print(resp.json())  # {"deleted": 3, "pruned": 1}
+print(resp.json())  # {"deleted": 3, "pruned": 1, "skipped": 0}
 ```
 
 Threads with pending or running runs are never expired mid-run — they are
