@@ -234,6 +234,10 @@ variable) — see the [configuration reference](/reference/configuration#checkpo
 A background sweep then applies each thread's policy:
 
 - `delete` — the thread, its runs and crons, and all checkpoint data are removed.
+  Set `AEGRA_THREAD_TTL_ALLOW_DELETE=false` to forbid this strategy entirely: the
+  server then refuses it at startup and rejects per-thread overrides with a 422.
+  Worth doing on any deployment that keeps conversations indefinitely, because the
+  bare-number shorthand (`AEGRA_THREAD_TTL=43200`) resolves to `delete`.
 - `keep_latest` — checkpoint history is compacted down to the latest state; the
   thread stays usable and the TTL re-arms, so history is pruned periodically.
 

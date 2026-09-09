@@ -156,14 +156,34 @@ def get_thread_ttl_config() -> ThreadTTLConfig | None:
             data: dict[str, object] = {"default_ttl": float(raw)}
         except ValueError:
             data = json.loads(raw)
-        return ThreadTTLConfig.model_validate(data)
+        return _reject_forbidden_delete(ThreadTTLConfig.model_validate(data), source="AEGRA_THREAD_TTL")
 
     checkpointer_config = load_checkpointer_config()
     ttl_config = checkpointer_config.get("ttl") if checkpointer_config else None
     if ttl_config is not None:
-        return ThreadTTLConfig.model_validate(ttl_config)
+        return _reject_forbidden_delete(
+            ThreadTTLConfig.model_validate(ttl_config), source="aegra.json checkpointer.ttl"
+        )
 
     return None
+
+
+def delete_strategy_allowed() -> bool:
+    """False when this deployment keeps conversations indefinitely."""
+    return settings.thread_ttl.AEGRA_THREAD_TTL_ALLOW_DELETE
+
+
+def _reject_forbidden_delete(config: ThreadTTLConfig, *, source: str) -> ThreadTTLConfig:
+    """Fail at startup rather than expiring threads a deployment means to keep."""
+    if config.strategy == "delete" and not delete_strategy_allowed():
+        raise ValueError(
+            f"{source} sets thread TTL strategy 'delete', but "
+            "AEGRA_THREAD_TTL_ALLOW_DELETE is false — this deployment retains threads. "
+            "Use strategy 'keep_latest' to compact checkpoint history instead. "
+            "Note a bare-number AEGRA_THREAD_TTL resolves to 'delete'; pass a JSON "
+            'object such as {"strategy": "keep_latest", "default_ttl": 43200}.'
+        )
+    return config
 
 
 async def _prune_checkpoint_history(thread_id: str) -> bool:

@@ -44,7 +44,11 @@ from aegra_api.models.search_limit import effective_search_limit
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_search_projection import thread_search_projection
 from aegra_api.services.thread_state_service import ThreadStateService
-from aegra_api.services.thread_ttl import get_thread_ttl_config, prune_expired_threads_for_user
+from aegra_api.services.thread_ttl import (
+    delete_strategy_allowed,
+    get_thread_ttl_config,
+    prune_expired_threads_for_user,
+)
 from aegra_api.utils.run_utils import strip_pinned_config_keys
 
 router = APIRouter(tags=["Threads"], dependencies=auth_dependency)
@@ -199,6 +203,15 @@ def _resolve_ttl_row(thread_id: str, requested: ThreadTTLSpec | None) -> ThreadT
             raise HTTPException(422, "ttl.default_ttl is required when no server-side TTL default is configured")
         ttl_minutes = requested_ttl
         strategy = requested_strategy or "delete"
+
+    # Server config is validated at startup; a per-thread override is not, so
+    # the same policy is enforced here rather than trusting the caller.
+    if strategy == "delete" and not delete_strategy_allowed():
+        raise HTTPException(
+            422,
+            "ttl.strategy 'delete' is not permitted on this deployment "
+            "(AEGRA_THREAD_TTL_ALLOW_DELETE is false); use 'keep_latest'",
+        )
 
     now = datetime.now(UTC)
     return ThreadTTLORM(
