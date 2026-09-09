@@ -47,15 +47,35 @@ _CLAIM_BATCH = 100
 # schema-drift canary in tests/unit/test_services/test_thread_ttl.py fails
 # loudly if a package bump changes the assumptions below.
 
-# Cheap probe so idle keep_latest cycles skip the three DELETEs: history is
-# prunable only when some namespace holds more than one checkpoint (PK-indexed).
-_HAS_PRUNABLE_HISTORY_SQL = """
-SELECT EXISTS (
-    SELECT 1 FROM checkpoints
-    WHERE thread_id = %(tid)s
-    GROUP BY checkpoint_ns
-    HAVING count(*) > 1
-) AS has_prunable_history
+# One probe, two answers, one index scan on checkpoints_thread_id_idx.
+#
+# has_prunable_history — idle keep_latest cycles skip the three DELETEs below:
+# history is prunable only when some namespace holds more than one checkpoint.
+#
+# uses_delta_channels — a channel annotated with langgraph's DeltaChannel stores
+# only a sentinel per step and one _DeltaSnapshot blob every snapshot_frequency
+# updates; its value is reconstructed by walking the parent chain back to that
+# snapshot. Dropping intermediate checkpoints and their writes severs the chain,
+# and the surviving head is rarely a snapshot point, so the channel silently
+# reconstructs as EMPTY — no error, no exception, the conversation is just gone.
+# deepagents puts `messages` on a DeltaChannel, so this is every deep-agent
+# thread. langgraph records per-channel counters in checkpoint metadata while a
+# delta channel is awaiting its next snapshot, and removes the key when the
+# counters go to zero; a thread that never used delta channels never has it.
+# Any checkpoint carrying it is therefore proof the thread is delta-backed.
+_PRUNE_PROBE_SQL = """
+SELECT
+    EXISTS (
+        SELECT 1 FROM checkpoints
+        WHERE thread_id = %(tid)s
+        GROUP BY checkpoint_ns
+        HAVING count(*) > 1
+    ) AS has_prunable_history,
+    EXISTS (
+        SELECT 1 FROM checkpoints
+        WHERE thread_id = %(tid)s
+          AND jsonb_exists(metadata, 'counters_since_delta_snapshot')
+    ) AS uses_delta_channels
 """
 
 # Latest checkpoint per (thread_id, checkpoint_ns) = max(checkpoint_id):
@@ -146,8 +166,11 @@ def get_thread_ttl_config() -> ThreadTTLConfig | None:
     return None
 
 
-async def _prune_checkpoint_history(thread_id: str) -> None:
+async def _prune_checkpoint_history(thread_id: str) -> bool:
     """Delete all checkpoint history for a thread except the latest state.
+
+    Returns False when the thread is delta-backed and was left untouched, so
+    the caller can report it separately from a real compaction.
 
     One explicit transaction (the lg_pool is autocommit): a concurrent reader
     sees pre- or post-prune state, never a torn middle. Idempotent — a re-run
@@ -157,15 +180,21 @@ async def _prune_checkpoint_history(thread_id: str) -> None:
     if pool is None:
         raise RuntimeError("Database not initialized")
     async with pool.connection() as conn:
-        cursor = await conn.execute(_HAS_PRUNABLE_HISTORY_SQL, {"tid": thread_id})
+        cursor = await conn.execute(_PRUNE_PROBE_SQL, {"tid": thread_id})
         row = await cursor.fetchone()
         # The lg_pool is configured with row_factory=dict_row — access by name.
-        if row is None or not row["has_prunable_history"]:
-            return
+        if row is None:
+            return True
+        if row["uses_delta_channels"]:
+            logger.info("Skipping delta-backed thread in keep_latest prune", thread_id=thread_id)
+            return False
+        if not row["has_prunable_history"]:
+            return True
         async with conn.transaction():
             await conn.execute(_PRUNE_CHECKPOINTS_SQL, {"tid": thread_id})
             await conn.execute(_PRUNE_WRITES_SQL, {"tid": thread_id})
             await conn.execute(_PRUNE_BLOBS_SQL, {"tid": thread_id})
+    return True
 
 
 async def _apply_strategy(
@@ -173,14 +202,16 @@ async def _apply_strategy(
 ) -> str:
     """Apply one expired row's strategy inside the claim transaction; return the outcome label."""
     if strategy == "keep_latest":
-        await _prune_checkpoint_history(thread_id)
-        # Re-arm: keep_latest is periodic compaction, not a one-shot.
+        pruned = await _prune_checkpoint_history(thread_id)
+        # Re-arm either way: a delta-backed thread stays claimed and re-armed so
+        # it is not re-examined every tick, and becomes prunable for free if a
+        # future langgraph makes intermediate checkpoints safe to drop.
         await session.execute(
             update(ThreadTTLORM)
             .where(ThreadTTLORM.thread_id == thread_id)
             .values(expires_at=now + timedelta(minutes=ttl_minutes))
         )
-        return "pruned"
+        return "pruned" if pruned else "skipped_delta"
 
     # Checkpoints first — ordering rationale from the delete_thread route: a
     # failure here leaves the thread row intact and retryable, never orphans.
@@ -239,19 +270,21 @@ def _expired_claim_stmt(
 
 async def _process_expired_batch(
     session: AsyncSession, stmt: Select[tuple[str, str, float]], now: datetime
-) -> tuple[int, int, int, list[str]]:
+) -> tuple[int, int, int, int, list[str]]:
     """Claim and process one batch in a single transaction.
 
-    Returns (claimed, deleted, pruned, failed_ids). The thread-row DELETE must
-    run in the claim transaction: it cascades into the locked thread_ttl row,
-    and a separate session would wait forever on a lock this transaction holds.
+    Returns (claimed, deleted, pruned, skipped, failed_ids). The thread-row
+    DELETE must run in the claim transaction: it cascades into the locked
+    thread_ttl row, and a separate session would wait forever on a lock this
+    transaction holds.
     """
     rows = (await session.execute(stmt)).all()
     if not rows:
-        return 0, 0, 0, []
+        return 0, 0, 0, 0, []
 
     deleted = 0
     pruned = 0
+    skipped = 0
     failed_ids: list[str] = []
     for thread_id, strategy, ttl_minutes in rows:
         try:
@@ -267,12 +300,14 @@ async def _process_expired_batch(
             continue
         if outcome == "deleted":
             deleted += 1
+        elif outcome == "skipped_delta":
+            skipped += 1
         else:
             pruned += 1
         THREAD_TTL_SWEPT.labels(outcome=outcome).inc()
 
     await session.commit()
-    return len(rows), deleted, pruned, failed_ids
+    return len(rows), deleted, pruned, skipped, failed_ids
 
 
 async def prune_expired_threads_for_user(
@@ -284,25 +319,27 @@ async def prune_expired_threads_for_user(
     """Immediately apply TTL strategies to the caller's expired threads.
 
     Backs POST /threads/prune; works without server-side TTL config (rows may
-    exist from per-thread opt-ins). Returns (deleted, pruned).
+    exist from per-thread opt-ins). Returns (deleted, pruned, skipped).
     """
     config = get_thread_ttl_config() or ThreadTTLConfig()
     total_deleted = 0
     total_pruned = 0
+    total_skipped = 0
     claimed_total = 0
     failed: set[str] = set()
     while claimed_total < config.sweep_limit:
         now = datetime.now(UTC)
         limit = min(_CLAIM_BATCH, config.sweep_limit - claimed_total)
         stmt = _expired_claim_stmt(now=now, limit=limit, user_id=user_id, auth_filter=auth_filter, exclude_ids=failed)
-        claimed, deleted, pruned, failed_ids = await _process_expired_batch(session, stmt, now)
+        claimed, deleted, pruned, skipped, failed_ids = await _process_expired_batch(session, stmt, now)
         if claimed == 0:
             break
         claimed_total += claimed
         total_deleted += deleted
         total_pruned += pruned
+        total_skipped += skipped
         failed.update(failed_ids)
-    return total_deleted, total_pruned
+    return total_deleted, total_pruned, total_skipped
 
 
 class ThreadTTLSweeper:
@@ -364,18 +401,20 @@ class ThreadTTLSweeper:
         claimed_total = 0
         deleted_total = 0
         pruned_total = 0
+        skipped_total = 0
         failed: set[str] = set()
         while claimed_total < config.sweep_limit:
             now = datetime.now(UTC)
             limit = min(_CLAIM_BATCH, config.sweep_limit - claimed_total)
             stmt = _expired_claim_stmt(now=now, limit=limit, exclude_ids=failed)
             async with maker() as session:
-                claimed, deleted, pruned, failed_ids = await _process_expired_batch(session, stmt, now)
+                claimed, deleted, pruned, skipped, failed_ids = await _process_expired_batch(session, stmt, now)
             if claimed == 0:
                 break
             claimed_total += claimed
             deleted_total += deleted
             pruned_total += pruned
+            skipped_total += skipped
             failed.update(failed_ids)
 
         if claimed_total:
@@ -384,6 +423,7 @@ class ThreadTTLSweeper:
                 claimed=claimed_total,
                 deleted=deleted_total,
                 pruned=pruned_total,
+                skipped_delta=skipped_total,
             )
 
 

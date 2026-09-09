@@ -1,4 +1,4 @@
-.PHONY: help install dev-install setup-hooks format lint type-check security test test-api test-cli test-cov clean run ci-check openapi e2e-dev e2e-prod e2e-auth e2e-both e2e-run-limits
+.PHONY: help install dev-install setup-hooks format lint type-check security test test-api test-cli test-cov clean run ci-check openapi e2e-dev e2e-prod e2e-auth e2e-both e2e-run-limits e2e-ttl-delta
 
 help:
 	@echo "Available commands:"
@@ -20,6 +20,7 @@ help:
 	@echo "  make e2e-auth      - Run auth E2E tests (JWT mock auth enabled)"
 	@echo "  make e2e-both      - Run E2E tests in both modes"
 	@echo "  make e2e-run-limits - Run per-org run-limit E2E tests (add REDIS=1 for worker mode)"
+	@echo "  make e2e-ttl-delta - Run thread-TTL keep_latest / DeltaChannel guard E2E tests"
 	@echo "  make clean         - Clean cache files"
 	@echo "  make run           - Run the server"
 
@@ -137,6 +138,9 @@ RUN_LIMITS_HARNESS := libs/aegra-api/tests/e2e/harness/run_limits
 RUN_LIMITS_PORT := 2029
 RUN_LIMITS_CEILING := 2
 
+TTL_DELTA_HARNESS := libs/aegra-api/tests/e2e/harness/thread_ttl
+TTL_DELTA_PORT := 2030
+
 e2e-run-limits:
 	@docker compose up -d postgres $(if $(REDIS),redis,)
 	@echo "Waiting for Postgres..."; \
@@ -170,6 +174,36 @@ e2e-run-limits:
 		uv run --package aegra-api pytest libs/aegra-api/tests/e2e/test_runs/test_org_run_limits.py -v --tb=short || rc=$$?; \
 	kill $$(cat /tmp/aegra-run-limits.pid) 2>/dev/null || true; \
 	rm -f /tmp/aegra-run-limits.pid; \
+	exit $$rc
+
+e2e-ttl-delta:
+	@docker compose up -d postgres
+	@echo "Waiting for Postgres..."; \
+	for i in $$(seq 1 30); do \
+		docker compose exec -T postgres pg_isready -U user -d aegra > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done
+	@set -e; \
+	export DATABASE_URL=postgresql://user:password@localhost:5434/aegra; \
+	export AEGRA_E2E_DSN=postgresql://user:password@localhost:5434/aegra; \
+	export AEGRA_CONFIG=$(PWD)/$(TTL_DELTA_HARNESS)/aegra.json; \
+	export SERVER_URL=http://127.0.0.1:$(TTL_DELTA_PORT); \
+	export AUTH_TYPE=noop BACKFILL_THREAD_STATE_ON_STARTUP=false; \
+	export REDIS_BROKER_ENABLED=false; \
+	uv run --package aegra-api uvicorn aegra_api.main:app \
+		--host 127.0.0.1 --port $(TTL_DELTA_PORT) > /tmp/aegra-ttl-delta.log 2>&1 & \
+	echo $$! > /tmp/aegra-ttl-delta.pid; \
+	for i in $$(seq 1 30); do \
+		curl -sf http://127.0.0.1:$(TTL_DELTA_PORT)/health > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done; \
+	rc=0; \
+	SERVER_URL=http://127.0.0.1:$(TTL_DELTA_PORT) \
+	AEGRA_E2E_DSN=postgresql://user:password@localhost:5434/aegra \
+		uv run --package aegra-api pytest \
+		libs/aegra-api/tests/e2e/test_threads/test_thread_ttl_delta_guard.py -v --tb=short || rc=$$?; \
+	kill $$(cat /tmp/aegra-ttl-delta.pid) 2>/dev/null || true; \
+	rm -f /tmp/aegra-ttl-delta.pid; \
 	exit $$rc
 
 clean:

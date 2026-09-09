@@ -95,6 +95,11 @@ class ThreadPruneResponse(BaseModel):
 
     deleted: int = Field(0, description="Expired threads fully deleted (strategy 'delete')")
     pruned: int = Field(0, description="Expired threads whose history was pruned (strategy 'keep_latest')")
+    skipped: int = Field(
+        0,
+        description="Expired threads left untouched because they use a DeltaChannel, "
+        "whose value cannot be reconstructed once intermediate checkpoints are dropped",
+    )
 
 
 class Thread(BaseModel):

@@ -1,0 +1,14 @@
+{
+  "graphs": {
+    "plain_agent": "./delta_graphs.py:plain_graph",
+    "delta_agent": "./delta_graphs.py:delta_graph"
+  },
+  "checkpointer": {
+    "ttl": {
+      "strategy": "keep_latest",
+      "default_ttl": 43200,
+      "sweep_interval_minutes": 60,
+      "sweep_limit": 100
+    }
+  }
+}

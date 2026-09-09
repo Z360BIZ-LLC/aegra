@@ -969,8 +969,10 @@ async def prune_threads(
     filters = await handle_event(ctx, {})
     auth_filter = build_metadata_filter(ThreadORM.metadata_json, filters)
 
-    deleted, pruned = await prune_expired_threads_for_user(session, user_id=user.identity, auth_filter=auth_filter)
-    return ThreadPruneResponse(deleted=deleted, pruned=pruned)
+    deleted, pruned, skipped = await prune_expired_threads_for_user(
+        session, user_id=user.identity, auth_filter=auth_filter
+    )
+    return ThreadPruneResponse(deleted=deleted, pruned=pruned, skipped=skipped)
 
 
 # response_model stays None: /threads/search projects arbitrary shapes via
