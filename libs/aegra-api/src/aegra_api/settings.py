@@ -561,6 +561,13 @@ class ThreadTTLSettings(EnvBase):
     AEGRA_THREAD_TTL: str | None = None
     LANGGRAPH_THREAD_TTL: str | None = None
 
+    # Deployments that keep conversations indefinitely set this false: the
+    # server then refuses `strategy: delete` from any source — server config or
+    # a per-thread override — instead of trusting every future config edit.
+    # The bare-number shorthand (AEGRA_THREAD_TTL=43200) resolves to `delete`,
+    # so the trap is one typo wide. Defaults true, matching stock behaviour.
+    AEGRA_THREAD_TTL_ALLOW_DELETE: bool = True
+
 
 class EventStreamingSettings(EnvBase):
     """Agent Protocol v2 event streaming (/threads/{id}/stream/events + /commands).

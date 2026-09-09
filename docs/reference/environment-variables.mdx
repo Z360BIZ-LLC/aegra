@@ -197,6 +197,7 @@ Cron firing is **at-least-once**: if a worker crashes after claiming a cron but 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AEGRA_THREAD_TTL` | — | Thread retention policy. Either a bare number (`default_ttl` in minutes) or a JSON object with any of `strategy`, `default_ttl`, `sweep_interval_minutes`, `sweep_limit` |
+| `AEGRA_THREAD_TTL_ALLOW_DELETE` | `true` | Set `false` on deployments that keep conversations indefinitely: the server then refuses `strategy: delete` at startup and rejects it on per-thread overrides with a 422. The bare-number shorthand resolves to `delete`, so this catches the common typo |
 | `LANGGRAPH_THREAD_TTL` | — | Fallback alias for `AEGRA_THREAD_TTL` (same format), so env files migrated from LangGraph Platform work unchanged. `AEGRA_THREAD_TTL` wins when both are set |
 
 ```bash

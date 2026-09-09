@@ -606,3 +606,65 @@ class TestPruneForUser:
         claim_sql = str(mock_batch.await_args_list[0].args[1].compile(dialect=postgresql.dialect()))
         assert "thread.user_id" in claim_sql
         assert "FOR UPDATE OF thread_ttl, thread SKIP LOCKED" in claim_sql
+
+
+class TestForbidDeleteStrategy:
+    """AEGRA_THREAD_TTL_ALLOW_DELETE=false: deployments that keep threads forever."""
+
+    @pytest.fixture(autouse=True)
+    def _forbid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings.thread_ttl, "AEGRA_THREAD_TTL_ALLOW_DELETE", False)
+
+    def test_bare_number_env_is_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The shorthand resolves to 'delete', which is exactly the trap."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(settings.thread_ttl, "AEGRA_THREAD_TTL", "43200")
+
+        with pytest.raises(ValueError, match="AEGRA_THREAD_TTL_ALLOW_DELETE"):
+            get_thread_ttl_config()
+
+    def test_explicit_delete_in_env_is_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            settings.thread_ttl, "AEGRA_THREAD_TTL", json.dumps({"strategy": "delete", "default_ttl": 60})
+        )
+
+        with pytest.raises(ValueError, match="strategy 'delete'"):
+            get_thread_ttl_config()
+
+    def test_delete_in_aegra_json_is_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "aegra.json").write_text(
+            json.dumps({"graphs": {"t": "./t.py:g"}, "checkpointer": {"ttl": {"strategy": "delete"}}})
+        )
+
+        with pytest.raises(ValueError, match="checkpointer.ttl"):
+            get_thread_ttl_config()
+
+    def test_keep_latest_is_unaffected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            settings.thread_ttl, "AEGRA_THREAD_TTL", json.dumps({"strategy": "keep_latest", "default_ttl": 43200})
+        )
+
+        config = get_thread_ttl_config()
+
+        assert config is not None
+        assert config.strategy == "keep_latest"
+
+    def test_no_config_is_still_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The guard must not turn "feature off" into a startup failure."""
+        monkeypatch.chdir(tmp_path)
+
+        assert get_thread_ttl_config() is None
+
+    def test_delete_allowed_by_default(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Stock behaviour is unchanged for deployments that never set the flag."""
+        monkeypatch.setattr(settings.thread_ttl, "AEGRA_THREAD_TTL_ALLOW_DELETE", True)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(settings.thread_ttl, "AEGRA_THREAD_TTL", "43200")
+
+        config = get_thread_ttl_config()
+
+        assert config is not None
+        assert config.strategy == "delete"

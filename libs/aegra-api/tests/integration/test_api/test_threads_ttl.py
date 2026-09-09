@@ -183,3 +183,41 @@ class TestPruneEndpoint:
 
         assert resp.status_code == 200
         assert resp.json() == {"deleted": 0, "pruned": 0, "skipped": 0}
+
+
+class TestForbidDeleteStrategyOnCreate:
+    """A per-thread override must not bypass a no-thread-deletion deployment."""
+
+    def test_per_thread_delete_override_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            threads_module,
+            "get_thread_ttl_config",
+            lambda: ThreadTTLConfig(strategy="keep_latest", default_ttl=43200),
+        )
+        monkeypatch.setattr(threads_module, "delete_strategy_allowed", lambda: False)
+        session = RecordingSession()
+        client = _make_client(session)
+
+        resp = client.post("/threads", json={"ttl": {"ttl": 60, "strategy": "delete"}})
+
+        assert resp.status_code == 422
+        assert "keep_latest" in resp.text
+        assert session.added == []
+        assert session.commits == 0
+
+    def test_keep_latest_override_still_works(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            threads_module,
+            "get_thread_ttl_config",
+            lambda: ThreadTTLConfig(strategy="keep_latest", default_ttl=43200),
+        )
+        monkeypatch.setattr(threads_module, "delete_strategy_allowed", lambda: False)
+        session = RecordingSession()
+        client = _make_client(session)
+
+        resp = client.post("/threads", json={"ttl": {"ttl": 60, "strategy": "keep_latest"}})
+
+        assert resp.status_code == 200, resp.text
+        ttl_rows = [o for o in session.added if isinstance(o, ThreadTTLORM)]
+        assert len(ttl_rows) == 1
+        assert ttl_rows[0].strategy == "keep_latest"
