@@ -1,5 +1,8 @@
 import pytest
+from httpx import AsyncClient
+from langgraph_sdk.errors import PermissionDeniedError
 
+from aegra_api.settings import settings
 from tests.e2e._utils import elog, get_e2e_client
 
 
@@ -38,6 +41,55 @@ async def test_store_endpoints_via_sdk():
     # Ensure deleted
     with pytest.raises(Exception):  # noqa: B017 - SDK doesn't expose specific exception type
         await client.store.get_item(ns, key=key)
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_store_search_accepts_sdk_page_size_500() -> None:
+    """LangGraph SDK clients page store search with limit=500; must not 422."""
+    client = get_e2e_client()
+    ns = ["notes"]
+    key = "e2e-limit-500"
+    await client.store.put_item(ns, key=key, value={"title": "limit-500"})
+    try:
+        search = await client.store.search_items(["notes"], limit=500)
+        elog("store.search_items limit=500", search)
+        assert isinstance(search, dict)
+        assert "items" in search
+        assert any(item.get("key") == key for item in search["items"])
+    finally:
+        await client.store.delete_item(ns, key=key)
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_store_search_returns_422_when_limit_exceeds_cap() -> None:
+    """limit above MAX_SEARCH_LIMIT is rejected before the store query."""
+    async with AsyncClient(base_url=settings.app.SERVER_URL, timeout=30.0) as http_client:
+        resp = await http_client.post(
+            "/store/items/search",
+            json={"namespace_prefix": ["notes"], "limit": settings.app.MAX_SEARCH_LIMIT + 1},
+        )
+    assert resp.status_code == 422, resp.text
+    assert "limit" in resp.text
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_org_prefix_without_org_membership_is_forbidden():
+    """The anonymous user has no org_id, so the "orgs" prefix is rejected with 403.
+
+    Relies on aegra.json configuring store.scopes {"orgs": ["org_id"]}. The org-scoped
+    happy path needs auth that sets org_id; it lives in the auth-enabled suite
+    (manual_auth_tests/test_store_org_isolation_e2e.py).
+    """
+    client = get_e2e_client()
+
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await client.store.put_item(["orgs", "shared-prompts"], key="greeting", value={"text": "hi"})
+    elog("store.put_item orgs prefix rejected", str(exc_info.value))
+    # Names the attribute the scope needs, so the message stays actionable.
+    assert "org_id" in str(exc_info.value)
 
 
 @pytest.mark.e2e

@@ -1,4 +1,4 @@
-"""Tests for AppSettings, DatabaseSettings, and WorkerSettings."""
+"""Tests for environment-backed settings models."""
 
 from urllib.parse import quote_plus
 
@@ -6,7 +6,14 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy.engine import make_url
 
-from aegra_api.settings import AppSettings, CronSettings, DatabaseSettings, WorkerSettings
+from aegra_api.settings import (
+    AppSettings,
+    CronSettings,
+    DatabaseSettings,
+    RedisSettings,
+    ThreadTTLSettings,
+    WorkerSettings,
+)
 
 
 class TestAppSettingsServerURL:
@@ -25,6 +32,7 @@ class TestAppSettingsServerURL:
             "LOG_LEVEL",
             "LOG_VERBOSITY",
             "AEGRA_CONFIG",
+            "MAX_SEARCH_LIMIT",
         ):
             monkeypatch.delenv(var, raising=False)
 
@@ -550,6 +558,29 @@ class TestMultiHostDatabaseURL:
         assert db.database_url_sync.startswith("postgresql://")
 
 
+class TestRedisSettingsValidation:
+    """Test that Redis resilience settings cannot enable unbounded retries."""
+
+    @pytest.mark.parametrize(
+        "setting_name",
+        ("REDIS_HEALTH_CHECK_INTERVAL", "REDIS_RETRY_ATTEMPTS"),
+    )
+    def test_rejects_negative_values(self, monkeypatch: pytest.MonkeyPatch, setting_name: str) -> None:
+        monkeypatch.setenv(setting_name, "-1")
+
+        with pytest.raises(ValidationError, match=setting_name):
+            RedisSettings(_env_file=None)
+
+    def test_accepts_zero_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("REDIS_HEALTH_CHECK_INTERVAL", "0")
+        monkeypatch.setenv("REDIS_RETRY_ATTEMPTS", "0")
+
+        redis = RedisSettings(_env_file=None)
+
+        assert redis.REDIS_HEALTH_CHECK_INTERVAL == 0
+        assert redis.REDIS_RETRY_ATTEMPTS == 0
+
+
 class TestWorkerSettingsLeaseValidation:
     """Test that lease timing invariants are enforced at startup."""
 
@@ -614,3 +645,47 @@ class TestCronSettingsValidation:
 
         with pytest.raises((ValueError, ValidationError), match="CRON_POLL_INTERVAL_SECONDS"):
             CronSettings(_env_file=None)
+
+
+class TestThreadTTLSettings:
+    """AEGRA_THREAD_TTL is passed through raw; parsing lives in services.thread_ttl."""
+
+    def test_defaults_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("AEGRA_THREAD_TTL", raising=False)
+        monkeypatch.delenv("LANGGRAPH_THREAD_TTL", raising=False)
+        ttl = ThreadTTLSettings(_env_file=None)
+
+        assert ttl.AEGRA_THREAD_TTL is None
+        assert ttl.LANGGRAPH_THREAD_TTL is None
+
+    def test_raw_string_passthrough(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AEGRA_THREAD_TTL", '{"default_ttl": 60}')
+        ttl = ThreadTTLSettings(_env_file=None)
+
+        assert ttl.AEGRA_THREAD_TTL == '{"default_ttl": 60}'
+
+
+class TestMaxSearchLimit:
+    """MAX_SEARCH_LIMIT defaults to the LangGraph Platform threads.search max."""
+
+    def test_default_matches_langgraph_threads_search_max(
+        self: "TestMaxSearchLimit", monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MAX_SEARCH_LIMIT", raising=False)
+        app = AppSettings(_env_file=None)
+        assert app.MAX_SEARCH_LIMIT == 1000
+
+    def test_reads_from_environment(self: "TestMaxSearchLimit", monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MAX_SEARCH_LIMIT", "500")
+        app = AppSettings(_env_file=None)
+        assert app.MAX_SEARCH_LIMIT == 500
+
+    def test_rejects_zero(self: "TestMaxSearchLimit", monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MAX_SEARCH_LIMIT", "0")
+        with pytest.raises(ValidationError):
+            AppSettings(_env_file=None)
+
+    def test_rejects_negative(self: "TestMaxSearchLimit", monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MAX_SEARCH_LIMIT", "-1")
+        with pytest.raises(ValidationError):
+            AppSettings(_env_file=None)

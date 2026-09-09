@@ -27,7 +27,7 @@ from aegra_api.services.langgraph_service import (
     get_langgraph_service,
 )
 from aegra_api.services.run_limits import resolve_org_id
-from aegra_api.services.run_status import finalize_run, update_run_status
+from aegra_api.services.run_status import finalize_run, start_run
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_state_service import ThreadStateService
 from aegra_api.services.webhook_service import send_run_webhook
@@ -42,15 +42,13 @@ _thread_state_service = ThreadStateService()
 # in checkpoints; bloating the thread row would slow the search read path too.
 _MAX_MATERIALIZED_STATE_BYTES = 4_000_000
 
-# Run IDs whose cancellation was triggered by lease loss (not user action).
-# When a heartbeat detects lease loss, it adds the run_id here before
-# cancelling the job task. execute_run's CancelledError handler checks
-# this set to skip finalize_run and SSE signaling — the reaper has already
-# re-enqueued the run and another worker will execute it. Without this,
-# the old worker would write status="interrupted" and send an SSE end event,
-# prematurely closing client streams and potentially overwriting the new
-# worker's status.
+# Cancellation provenance prevents infrastructure stops from looking user-initiated.
 _lease_loss_cancellations: set[str] = set()
+_shutdown_cancellations: set[str] = set()
+_timeout_cancellations: set[str] = set()
+
+_TIMEOUT_ERROR = "Job exceeded maximum execution time"
+_TIMEOUT_SAFE_MESSAGE = "TimeoutError: execution failed"
 
 
 async def execute_run(job: RunJob) -> None:
@@ -61,14 +59,18 @@ async def execute_run(job: RunJob) -> None:
     """
     run_id = job.identity.run_id
     thread_id = job.identity.thread_id
-    is_lease_loss = False
-    # Bound for any except handler that fires before the post-status-update
-    # rebind below. If update_run_status itself raises, RunDurationMs ends up
-    # ~0 — accurate, since the graph never started.
+    user_id = job.user.identity
+    resumes_elsewhere = False
+    finalized = False
+    # Bound for any except handler that fires before the post-start rebind
+    # below. If start_run itself raises, RunDurationMs ends up ~0 — accurate,
+    # since the graph never started.
     started_at = perf_counter()
 
     try:
-        await update_run_status(run_id, "running")
+        if not await start_run(run_id, user_id=user_id):
+            logger.info("Run became terminal before execution started", run_id=run_id)
+            return
         # Rebind so RunDurationMs measures only graph execution, not the
         # preceding status-update DB write.
         started_at = perf_counter()
@@ -77,9 +79,10 @@ async def execute_run(job: RunJob) -> None:
         final_output = await _stream_graph(job)
 
         if final_output.has_interrupt:
-            await finalize_run(
+            finalized = await finalize_run(
                 run_id,
                 thread_id,
+                user_id=user_id,
                 status="interrupted",
                 thread_status="interrupted",
                 output=final_output.data,
@@ -90,9 +93,10 @@ async def execute_run(job: RunJob) -> None:
             _emit_run_terminal_metrics(job, "interrupted", started_at)
             await _send_run_webhook(job, "interrupted", final_output.data)
         else:
-            await finalize_run(
+            finalized = await finalize_run(
                 run_id,
                 thread_id,
+                user_id=user_id,
                 status="success",
                 thread_status="idle",
                 output=final_output.data,
@@ -105,32 +109,73 @@ async def execute_run(job: RunJob) -> None:
 
     except asyncio.CancelledError:
         if run_id in _lease_loss_cancellations:
-            # Lease was lost — the reaper re-enqueued this run for another
-            # worker.  Do NOT finalize, signal done, or clean up the broker.
-            # The new worker owns the run now.
-            is_lease_loss = True
+            resumes_elsewhere = True
             logger.info("Lease-loss cancel, skipping finalize", run_id=run_id)
             emit_metric("LeaseLossCancellation", 1, properties=_run_metric_properties(job))
+        elif run_id in _shutdown_cancellations:
+            # Drain cancel: the run goes back to the queue, so finalizing here
+            # would destroy work a plain crash (SIGKILL) recovers (#474).
+            resumes_elsewhere = True
+            logger.info("Shutdown drain cancel, skipping finalize for requeue", run_id=run_id)
+        elif run_id in _timeout_cancellations:
+            finalized = await finalize_run(
+                run_id,
+                thread_id,
+                user_id=user_id,
+                status="error",
+                thread_status="error",
+                output={},
+                error=_TIMEOUT_ERROR,
+            )
+            _emit_run_terminal_metrics(job, "error", started_at, terminal_reason="timeout")
+            await _send_run_webhook(job, "error", {}, error_message=_TIMEOUT_ERROR)
+            if finalized:
+                await _best_effort_signal(
+                    streaming_service.signal_run_error,
+                    run_id,
+                    _TIMEOUT_SAFE_MESSAGE,
+                    "TimeoutError",
+                )
         else:
-            await finalize_run(run_id, thread_id, status="interrupted", thread_status="idle", output={})
+            finalized = await finalize_run(
+                run_id,
+                thread_id,
+                user_id=user_id,
+                status="interrupted",
+                thread_status="idle",
+                output={},
+            )
             _emit_run_terminal_metrics(job, "interrupted", started_at, terminal_reason="cancelled")
             await _send_run_webhook(job, "cancelled", {})
-            await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
+            if finalized:
+                await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
         raise
     except Exception as exc:
         logger.exception("Run failed", run_id=run_id)
         safe_message = f"{type(exc).__name__}: execution failed"
-        await finalize_run(run_id, thread_id, status="error", thread_status="error", output={}, error=str(exc))
+        finalized = await finalize_run(
+            run_id,
+            thread_id,
+            user_id=user_id,
+            status="error",
+            thread_status="error",
+            output={},
+            error=str(exc),
+        )
         _emit_run_terminal_metrics(job, "error", started_at, error_class=type(exc).__name__)
         await _send_run_webhook(job, "error", {}, error_message=str(exc))
-        await _best_effort_signal(streaming_service.signal_run_error, run_id, safe_message, type(exc).__name__)
+        if finalized:
+            await _best_effort_signal(streaming_service.signal_run_error, run_id, safe_message, type(exc).__name__)
     else:
-        status = "interrupted" if final_output.has_interrupt else "success"
-        await _best_effort_signal(_signal_end_event, run_id, status)
+        if finalized:
+            status = "interrupted" if final_output.has_interrupt else "success"
+            await _best_effort_signal(_signal_end_event, run_id, status)
     finally:
         _lease_loss_cancellations.discard(run_id)
+        _shutdown_cancellations.discard(run_id)
+        _timeout_cancellations.discard(run_id)
         active_runs.pop(run_id, None)
-        if not is_lease_loss:
+        if not resumes_elsewhere:
             await streaming_service.cleanup_run(run_id)
             await _signal_run_done(run_id)
 

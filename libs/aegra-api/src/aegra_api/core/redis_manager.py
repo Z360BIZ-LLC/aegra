@@ -5,6 +5,10 @@ from urllib.parse import urlparse
 import redis.asyncio as aioredis
 import structlog
 from helpers.redis_url import redis_credentials_configured, redis_url_with_credentials
+from redis.asyncio.retry import Retry
+from redis.backoff import ExponentialBackoff
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from aegra_api.settings import settings
 
@@ -38,12 +42,19 @@ class RedisManager:
 
         # health_check_interval keeps pooled connections alive across long BLPOP
         # idles so the next blocking call doesn't raise on a half-closed socket.
+        # Directly constructed pools default to zero retries; bounded retries survive
+        # idle disconnects/failovers. Lease acquisition deduplicates RPUSH replays (#505).
         self._pool = aioredis.ConnectionPool.from_url(
             authenticated_url,
             max_connections=settings.redis.REDIS_MAX_CONNECTIONS,
             decode_responses=True,
             socket_keepalive=True,
-            health_check_interval=30,
+            health_check_interval=settings.redis.REDIS_HEALTH_CHECK_INTERVAL,
+            retry=Retry(
+                ExponentialBackoff(cap=1.0, base=0.05),
+                settings.redis.REDIS_RETRY_ATTEMPTS,
+            ),
+            retry_on_error=[RedisConnectionError, RedisTimeoutError],
         )
         self._client = aioredis.Redis(connection_pool=self._pool)
 

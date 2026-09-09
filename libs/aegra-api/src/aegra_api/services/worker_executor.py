@@ -22,7 +22,7 @@ from redis import RedisError
 from redis import TimeoutError as RedisTimeoutError
 from sqlalchemy import Select, select, update
 
-from aegra_api.core.active_runs import active_runs
+from aegra_api.core.active_runs import active_runs, explicit_run_cancellations
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
@@ -30,8 +30,13 @@ from aegra_api.models.run_job import RunJob
 from aegra_api.observability.span_enrichment import merge_run_metadata, set_trace_context
 from aegra_api.services import run_limits
 from aegra_api.services.base_executor import BaseExecutor
-from aegra_api.services.run_executor import _lease_loss_cancellations, execute_run
-from aegra_api.services.run_status import finalize_run, update_run_status
+from aegra_api.services.run_executor import (
+    _lease_loss_cancellations,
+    _shutdown_cancellations,
+    _timeout_cancellations,
+    execute_run,
+)
+from aegra_api.services.run_status import finalize_run
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -46,12 +51,52 @@ def _is_valid_run_id(value: str) -> bool:
     return bool(_RUN_ID_PATTERN.match(value))
 
 
+async def _cleanup_cancelled_execution(run_id: str, execution_task: asyncio.Task[None]) -> None:
+    """Stop execution and persist an explicit cancellation when applicable."""
+    if not execution_task.done():
+        execution_task.cancel()
+    await asyncio.gather(execution_task, return_exceptions=True)
+
+    if run_id not in explicit_run_cancellations:
+        return
+
+    try:
+        identity = await _get_run_identity(run_id)
+        if identity is None:
+            return
+
+        thread_id, user_id = identity
+        await finalize_run(
+            run_id,
+            thread_id,
+            user_id=user_id,
+            status="interrupted",
+            thread_status="idle",
+            output={},
+        )
+    except Exception:
+        logger.exception("Failed to persist explicit run cancellation", run_id=run_id)
+
+
+async def _await_cancellation_cleanup(cleanup_task: asyncio.Task[None]) -> None:
+    """Let cleanup finish even if the owning task is cancelled repeatedly."""
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            if cleanup_task.cancelled():
+                raise
+    await cleanup_task
+
+
 class WorkerExecutor(BaseExecutor):
     """Dispatches runs via Redis List; workers consume with BLPOP + semaphore."""
 
     def __init__(self) -> None:
         self._worker_tasks: list[asyncio.Task[None]] = []
-        self._job_tasks: set[asyncio.Task[None]] = set()
+        # Task -> run_id, mapped at creation: a task cancelled before it ever
+        # runs has no active_runs entry, yet its run still needs the drain requeue.
+        self._job_tasks: dict[asyncio.Task[None], str] = {}
         self._running = False
         self._instance_id = f"{socket.gethostname()}-{os.getpid()}"
 
@@ -132,19 +177,32 @@ class WorkerExecutor(BaseExecutor):
         drain_timeout = settings.worker.WORKER_DRAIN_TIMEOUT
 
         # Wait for in-flight job tasks to finish
+        drained: list[str] = []
         if self._job_tasks:
             logger.info("Draining in-flight jobs", count=len(self._job_tasks))
-            _, pending = await asyncio.wait(self._job_tasks, timeout=drain_timeout)
-            for task in pending:
-                task.cancel()
+            _, pending = await asyncio.wait(set(self._job_tasks), timeout=drain_timeout)
             if pending:
+                # Requeue drain survivors instead of finalizing work that a
+                # plain crash would recover (#474).
+                drained = [
+                    run_id
+                    for task, run_id in self._job_tasks.items()
+                    if task in pending and run_id not in explicit_run_cancellations
+                ]
+                _shutdown_cancellations.update(drained)
+                for task in pending:
+                    task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
 
-        # Cancel worker loops
+        # Cancel worker loops before the requeue push: a loop still blocked in
+        # BLPOP would steal the handed-off jobs back onto this dying instance.
         for task in self._worker_tasks:
             task.cancel()
         if self._worker_tasks:
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+
+        if drained:
+            await _requeue_drained_runs(drained)
 
         self._worker_tasks.clear()
         self._job_tasks.clear()
@@ -189,9 +247,16 @@ class WorkerExecutor(BaseExecutor):
                     semaphore.release()
                     continue
 
+                if not self._running:
+                    # Dequeued while shutdown was already underway: hand it back
+                    # rather than start untracked work on a terminating instance.
+                    await _push_back(run_id)
+                    semaphore.release()
+                    break
+
                 task = asyncio.create_task(self._execute_and_release(run_id, worker_name, semaphore))
-                self._job_tasks.add(task)
-                task.add_done_callback(self._job_tasks.discard)
+                self._job_tasks[task] = run_id
+                task.add_done_callback(lambda t: self._job_tasks.pop(t, None))
 
             except asyncio.CancelledError:
                 break
@@ -214,40 +279,48 @@ class WorkerExecutor(BaseExecutor):
         current_task = asyncio.current_task()
         if current_task is not None:
             active_runs[run_id] = current_task
+        execution_task = asyncio.create_task(self._execute_with_lease(run_id, worker_name))
         try:
-            await asyncio.wait_for(
-                self._execute_with_lease(run_id, worker_name),
+            done, _ = await asyncio.wait(
+                {execution_task},
                 timeout=settings.worker.BG_JOB_TIMEOUT_SECS,
             )
-        except TimeoutError:
-            logger.error(
-                "Job exceeded timeout, killing",
-                worker=worker_name,
-                run_id=run_id,
-                timeout_secs=settings.worker.BG_JOB_TIMEOUT_SECS,
-            )
-            # Look up thread_id so we can set thread status to "error" too.
-            # When wait_for fires, execute_run's CancelledError handler runs first
-            # and sets thread_status="idle" — we must correct that to "error".
-            thread_id = await _get_thread_id_for_run(run_id)
-            if thread_id is not None:
-                await finalize_run(
-                    run_id,
-                    thread_id,
-                    status="error",
-                    thread_status="error",
-                    error="Job exceeded maximum execution time",
-                )
+            if execution_task in done:
+                await execution_task
             else:
-                # Fallback: update run status only (thread_id lookup failed)
-                await update_run_status(run_id, "error", error="Job exceeded maximum execution time")
-            await _release_lease(run_id, worker_name)
+                logger.error(
+                    "Job exceeded timeout, killing",
+                    worker=worker_name,
+                    run_id=run_id,
+                    timeout_secs=settings.worker.BG_JOB_TIMEOUT_SECS,
+                )
+                _timeout_cancellations.add(run_id)
+                execution_task.cancel()
+                await asyncio.gather(execution_task, return_exceptions=True)
+
+                identity = await _get_run_identity(run_id)
+                if identity is not None:
+                    thread_id, user_id = identity
+                    await finalize_run(
+                        run_id,
+                        thread_id,
+                        user_id=user_id,
+                        status="error",
+                        thread_status="error",
+                        error="Job exceeded maximum execution time",
+                    )
+                await _release_lease(run_id, worker_name)
         except asyncio.CancelledError:
             logger.info("Job task cancelled", worker=worker_name, run_id=run_id)
+            cleanup_task = asyncio.create_task(_cleanup_cancelled_execution(run_id, execution_task))
+            await _await_cancellation_cleanup(cleanup_task)
             raise
         except Exception:
             logger.exception("Unexpected error in job execution", run_id=run_id)
         finally:
+            _timeout_cancellations.discard(run_id)
+            _shutdown_cancellations.discard(run_id)
+            explicit_run_cancellations.discard(run_id)
             active_runs.pop(run_id, None)
             semaphore.release()
 
@@ -355,11 +428,15 @@ def _oldest_pending_stmt(*, unscoped_only: bool) -> Select[tuple[str]]:
     return stmt.order_by(RunORM.created_at.asc()).limit(1)
 
 
-async def _get_thread_id_for_run(run_id: str) -> str | None:
-    """Look up the thread_id for a run. Returns None if the row is missing."""
+async def _get_run_identity(run_id: str) -> tuple[str, str] | None:
+    """Look up the thread and tenant identity for a run."""
     maker = _get_session_maker()
     async with maker() as session:
-        return await session.scalar(select(RunORM.thread_id).where(RunORM.run_id == run_id))
+        result = await session.execute(select(RunORM.thread_id, RunORM.user_id).where(RunORM.run_id == run_id))
+        row = result.one_or_none()
+        if row is None:
+            return None
+        return row.thread_id, row.user_id
 
 
 # ------------------------------------------------------------------
@@ -427,6 +504,52 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
         job = RunJob.from_run_orm(run_orm)
         trace = run_orm.execution_params.get("trace", {})
         return _LoadedRun(job=job, trace=trace)
+
+
+async def _push_back(run_id: str) -> None:
+    """Best-effort return of a dequeued-but-unstarted run to the queue."""
+    try:
+        client = redis_manager.get_client()
+        await client.rpush(settings.worker.WORKER_QUEUE_KEY, run_id)  # type: ignore[arg-type]
+    except RedisError:
+        # Row is still pending/unclaimed; the stuck-pending reaper recovers it.
+        logger.warning("Could not push back dequeued run at shutdown", run_id=run_id)
+
+
+async def _requeue_drained_runs(run_ids: list[str]) -> None:
+    """Hand runs cancelled at the drain deadline back to the queue.
+
+    Rows still 'running' were mid-execution with finalize skipped; rows still
+    'pending' were dequeued but never claimed. Both must reach another instance.
+    """
+    maker = _get_session_maker()
+    async with maker() as session:
+        result = await session.execute(
+            update(RunORM)
+            .where(RunORM.run_id.in_(run_ids), RunORM.status.in_(["running", "pending"]))
+            .values(status="pending", claimed_by=None, lease_expires_at=None)
+            .returning(RunORM.run_id)
+        )
+        reset_ids = [row[0] for row in result.fetchall()]
+        await session.commit()
+
+    if not reset_ids:
+        return
+
+    logger.info("Requeueing drained runs for another instance", count=len(reset_ids), run_ids=reset_ids)
+    pushed = 0
+    try:
+        client = redis_manager.get_client()
+        for run_id in reset_ids:
+            await client.rpush(settings.worker.WORKER_QUEUE_KEY, run_id)  # type: ignore[arg-type]
+            pushed += 1
+    except RedisError:
+        # Rows are already pending + unclaimed: the stuck-pending reaper or the
+        # Postgres poll fallback on a surviving instance picks them up.
+        logger.warning(
+            "Redis unavailable during drain requeue, reaper will recover",
+            run_ids=reset_ids[pushed:],
+        )
 
 
 async def _release_lease(run_id: str, worker_name: str) -> None:

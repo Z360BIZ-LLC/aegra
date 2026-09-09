@@ -24,6 +24,7 @@ from aegra_api.api.threads import router as threads_router
 from aegra_api.config import CorsConfig, HttpConfig, get_config_dir, load_http_config
 from aegra_api.core.app_loader import load_custom_app
 from aegra_api.core.auth_deps import auth_dependency
+from aegra_api.core.auth_enforcement import apply_auth_enforcement
 from aegra_api.core.auth_middleware import get_auth_backend
 from aegra_api.core.database import db_manager
 from aegra_api.core.health import router as health_router
@@ -45,6 +46,7 @@ from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
 from aegra_api.services.run_promoter import run_promoter
 from aegra_api.services.state_backfill import run_startup_backfill
+from aegra_api.services.thread_ttl import get_thread_ttl_config, thread_ttl_sweeper
 from aegra_api.settings import settings
 from aegra_api.utils.setup_logging import setup_logging
 
@@ -187,6 +189,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if settings.run_limits.enforcing:
         await run_promoter.start()
 
+    # Start thread TTL sweeper (deletes/compacts expired threads); resolving
+    # the config here also fails fast on an invalid retention policy.
+    if get_thread_ttl_config() is not None:
+        await thread_ttl_sweeper.start()
+
     # One-time materialized-state backfill for pre-existing threads. Runs in the
     # background (never blocks startup); guarded by an advisory lock + completion
     # marker so only one instance runs it and only until it's done once.
@@ -221,7 +228,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await backfill_task_handle
 
-    # Shutdown order: promoter → cron → reaper → executor (drains jobs) → broker → Redis → DB
+    # Shutdown order: ttl sweeper → promoter → cron → reaper → executor (drains
+    # jobs) → broker → Redis → DB
+    if get_thread_ttl_config() is not None:
+        await thread_ttl_sweeper.stop()
     if settings.run_limits.enforcing:
         await run_promoter.stop()
     if settings.cron.CRON_ENABLED:
@@ -258,7 +268,7 @@ async def general_exception_handler(_request: Request, exc: Exception) -> JSONRe
         content=AgentProtocolError(
             error="internal_error",
             message="An unexpected error occurred",
-            details={"exception": str(exc)},
+            details=None,  # FIX: do not leak internal exception details
         ).model_dump(),
     )
 
@@ -394,6 +404,10 @@ def _include_core_routers(app: FastAPI) -> None:
     app.include_router(crons_router)
     app.include_router(store_router)
     app.include_router(event_streaming_router)
+
+    # Attach @auth.on dispatch from the route registry. Routes must opt out
+    # explicitly; forgetting the in-body call no longer disables authorization.
+    apply_auth_enforcement(app)
 
 
 def create_app() -> FastAPI:
