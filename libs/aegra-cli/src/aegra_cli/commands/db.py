@@ -325,3 +325,87 @@ def backfill_thread_state_cmd(
         f"[green]Done.[/green] total={stats['total']} materialized={stats['materialized']} "
         f"skipped_no_graph={stats['skipped_no_graph']} failed={stats['failed']}"
     )
+
+
+@db.command("backfill-thread-ttl")
+@click.option(
+    "--strategy",
+    type=click.Choice(["keep_latest", "delete"]),
+    default="keep_latest",
+    help="TTL strategy to arm threads with.",
+)
+@click.option(
+    "--ttl-minutes", type=float, default=43200, help="TTL in minutes (default 43200 = 30 days)."
+)
+@click.option("--limit", type=int, default=1000, help="Threads to arm in this tranche.")
+@click.option(
+    "--older-than-days",
+    type=int,
+    default=None,
+    help="Only arm threads untouched for this many days.",
+)
+@click.option("--dry-run", is_flag=True, help="Report what would be armed, change nothing.")
+def backfill_thread_ttl_cmd(
+    strategy: str, ttl_minutes: float, limit: int, older_than_days: int | None, dry_run: bool
+) -> None:
+    """Arm pre-existing threads for the TTL sweep.
+
+    A thread_ttl row is only written by POST /threads, so threads created before
+    TTL was configured are invisible to the sweeper. This arms them in tranches
+    -- arming N threads makes N threads immediately due, so on a large database
+    run it repeatedly and let the sweep drain each tranche.
+
+    Example:
+
+        aegra db backfill-thread-ttl --limit 5000 --older-than-days 30
+    """
+    import asyncio
+
+    console.print(
+        Panel(
+            f"[bold green]Arming threads for TTL[/bold green] strategy={strategy} "
+            f"ttl_minutes={ttl_minutes:g}",
+            title="[bold]Thread TTL Backfill[/bold]",
+            border_style="green",
+        )
+    )
+
+    from aegra_api.core.database import db_manager
+    from aegra_api.core.orm import _get_session_maker
+    from aegra_api.services.thread_ttl import delete_strategy_allowed
+    from aegra_api.services.thread_ttl_backfill import backfill_thread_ttl
+
+    if strategy == "delete" and not delete_strategy_allowed():
+        console.print(
+            "[bold red]Refused:[/bold red] strategy 'delete' is not permitted "
+            "(AEGRA_THREAD_TTL_ALLOW_DELETE is false)."
+        )
+        sys.exit(1)
+
+    async def _run() -> dict[str, int]:
+        await db_manager.initialize()
+        try:
+            maker = _get_session_maker()
+            async with maker() as session:
+                return await backfill_thread_ttl(
+                    session,
+                    strategy=strategy,
+                    ttl_minutes=ttl_minutes,
+                    limit=limit,
+                    older_than_days=older_than_days,
+                    dry_run=dry_run,
+                )
+        finally:
+            await db_manager.close()
+
+    try:
+        stats = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Backfill failed:[/bold red] {exc}")
+        sys.exit(1)
+
+    verb = "would arm" if dry_run else "armed"
+    console.print(
+        f"[green]Done.[/green] {verb}={stats['armed'] or min(stats['candidates'], limit)} "
+        f"candidates={stats['candidates']} remaining={stats['remaining']}"
+    )
