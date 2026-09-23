@@ -116,9 +116,14 @@ async def test_sdk_receives_values_events() -> None:
     client = get_client(url=_base_url())
 
     value_payloads: list[dict] = []
+    event_run_ids: set[str] = set()
     async with client.threads.stream(assistant_id=assistant_id) as ts:
-        await ts.run.start(input={"messages": [{"role": "user", "content": json.dumps({"delay": 0.1, "steps": 1})}]})
+        run = await ts.run.start(
+            input={"messages": [{"role": "user", "content": json.dumps({"delay": 0.1, "steps": 1})}]}
+        )
         async for event in ts.events:
+            if isinstance(event.get("run_id"), str):
+                event_run_ids.add(event["run_id"])
             if event.get("method") == "values":
                 value_payloads.append(event["params"]["data"])
             if event.get("method") == "lifecycle" and event["params"]["data"]["event"] in ("completed", "failed"):
@@ -127,6 +132,7 @@ async def test_sdk_receives_values_events() -> None:
     elog("sdk values events", value_payloads)
     assert value_payloads, "no values events received"
     assert any("messages" in payload for payload in value_payloads)
+    assert event_run_ids == {run["run_id"]}
 
 
 @pytest.mark.e2e

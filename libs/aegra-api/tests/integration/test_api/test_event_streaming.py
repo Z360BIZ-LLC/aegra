@@ -192,6 +192,9 @@ class TestStreamRoute:
         assert "content-block-delta" in body
         assert "event: lifecycle" in body
         assert "completed" in body
+        envelopes = [json.loads(line.removeprefix("data: ")) for line in body.splitlines() if line.startswith("data: ")]
+        assert envelopes
+        assert {envelope["run_id"] for envelope in envelopes} == {run_id}
 
     async def test_stream_emits_dual_sdk_interrupt_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
         run_id = f"run-{uuid.uuid4().hex[:8]}"

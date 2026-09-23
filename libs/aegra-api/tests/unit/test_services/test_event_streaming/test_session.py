@@ -97,6 +97,7 @@ class TestForwarding:
             ("messages", "message-finish"),
             ("lifecycle", "completed"),
         ]
+        assert {event["run_id"] for event in events} == {"run-1"}
 
     async def test_values_payload_in_params_data(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("values", _protocol_event("values", {"a": 1})), ("end", {"status": "success"})])
@@ -167,6 +168,7 @@ class TestSeqAndFilter:
         await _seed(manager, "run-2", [("values", _protocol_event("values", {"a": 2})), ("end", {"status": "success"})])
         events = await _collect(_make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1", "run-2")))
         assert [e["seq"] for e in events] == [1, 2, 3, 4, 5, 6]
+        assert [e["run_id"] for e in events] == ["run-1"] * 3 + ["run-2"] * 3
 
     async def test_channel_filter_drops_unsubscribed(self, manager: BrokerManager) -> None:
         await _seed(
