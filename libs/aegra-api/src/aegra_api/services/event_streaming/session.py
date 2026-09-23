@@ -145,37 +145,39 @@ class ThreadEventSession:
         if run_status in _TERMINAL_RUN_STATUSES and not replayed:
             return
 
-        for envelope in self._emit([("lifecycle", self._root_lifecycle("running"), [])], f"{run_id}:running"):
+        for envelope in self._emit(
+            [("lifecycle", self._root_lifecycle("running"), [])], f"{run_id}:running", run_id=run_id
+        ):
             yield envelope
 
         for event_id, raw_event in replayed:
             seen.add(event_id)
-            for envelope in self._project(event_id, raw_event):
+            for envelope in self._project(event_id, raw_event, run_id=run_id):
                 yield envelope
             if _is_terminal(raw_event):
                 return
 
         if run_status in _TERMINAL_RUN_STATUSES:
-            for envelope in self._project(f"{run_id}:status-end", ("end", {"status": run_status})):
+            for envelope in self._project(f"{run_id}:status-end", ("end", {"status": run_status}), run_id=run_id):
                 yield envelope
             return
 
         async for event_id, raw_event in broker.aiter():
             if event_id in seen:
                 continue
-            for envelope in self._project(event_id, raw_event):
+            for envelope in self._project(event_id, raw_event, run_id=run_id):
                 yield envelope
             if _is_terminal(raw_event):
                 return
 
-    def _project(self, event_id: str, raw_event: Any) -> list[dict[str, Any]]:
+    def _project(self, event_id: str, raw_event: Any, *, run_id: str) -> list[dict[str, Any]]:
         """Re-envelope one raw broker event into filtered, seq'd envelopes."""
         method, payload = _unwrap(raw_event)
         if method is None:
             return []
-        return self._emit(self._channel_events(method, payload), event_id)
+        return self._emit(self._channel_events(method, payload), event_id, run_id=run_id)
 
-    def _emit(self, channel_events: list[_ChannelEvent], event_id: str) -> list[dict[str, Any]]:
+    def _emit(self, channel_events: list[_ChannelEvent], event_id: str, *, run_id: str) -> list[dict[str, Any]]:
         """Filter + seq a batch of channel events into wire envelopes."""
         envelopes: list[dict[str, Any]] = []
         for index, (channel, data, namespace) in enumerate(channel_events):
@@ -192,6 +194,7 @@ class ThreadEventSession:
                 build_event(
                     channel,
                     data,
+                    run_id=run_id,
                     namespace=namespace,
                     seq=self._seq,
                     event_id=f"{event_id}:{index}",

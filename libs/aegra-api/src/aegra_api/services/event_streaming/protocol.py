@@ -40,6 +40,7 @@ def build_event(
     method: EventMethod | str,
     data: dict[str, Any],
     *,
+    run_id: str,
     namespace: list[str] | None = None,
     seq: int,
     event_id: str | None = None,
@@ -52,7 +53,7 @@ def build_event(
     ``params.timestamp`` ms-epoch server time).
     """
     params: dict[str, Any] = {"data": data, "namespace": namespace or [], "timestamp": time.time_ns() // 1_000_000}
-    event: dict[str, Any] = {"type": "event", "seq": seq, "method": method, "params": params}
+    event: dict[str, Any] = {"type": "event", "run_id": run_id, "seq": seq, "method": method, "params": params}
     if event_id is not None:
         event["event_id"] = event_id
     return event

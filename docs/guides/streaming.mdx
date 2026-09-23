@@ -323,14 +323,14 @@ curl -N -X POST http://localhost:8000/threads/$THREAD/stream/events \
   -d '{"channels": ["messages", "values", "lifecycle"]}'
 ```
 
-The client reads each frame's `data:` line — a protocol event envelope. `seq` is the cursor you echo back as `since`; `event_id` dedups across reconnects; `params.data` is the payload and `params.namespace` the subgraph path:
+The client reads each frame's `data:` line — a protocol event envelope. `run_id` identifies the run that emitted the event, including when one thread stream carries events from multiple runs. `seq` is the cursor you echo back as `since`; `event_id` dedups across reconnects; `params.data` is the payload and `params.namespace` the subgraph path:
 
 ```
-data: {"type":"event","seq":1,"event_id":"...:1","method":"messages","params":{"data":{"event":"message-start","role":"ai","id":"msg_1"},"namespace":[]}}
+data: {"type":"event","run_id":"run_123","seq":1,"event_id":"...:1","method":"messages","params":{"data":{"event":"message-start","role":"ai","id":"msg_1"},"namespace":[]}}
 
-data: {"type":"event","seq":2,"event_id":"...:2","method":"messages","params":{"data":{"event":"content-block-delta","index":0,"delta":{"type":"text-delta","text":"Hello"}},"namespace":[]}}
+data: {"type":"event","run_id":"run_123","seq":2,"event_id":"...:2","method":"messages","params":{"data":{"event":"content-block-delta","index":0,"delta":{"type":"text-delta","text":"Hello"}},"namespace":[]}}
 
-data: {"type":"event","seq":3,"event_id":"...:3","method":"lifecycle","params":{"data":{"event":"completed"},"namespace":[]}}
+data: {"type":"event","run_id":"run_123","seq":3,"event_id":"...:3","method":"lifecycle","params":{"data":{"event":"completed"},"namespace":[]}}
 ```
 
 ### Channels
@@ -344,6 +344,7 @@ When you subscribe to the `input` channel, a graph interrupt arrives as an `inpu
 ```json
 {
   "type": "event",
+  "run_id": "run_123",
   "seq": 4,
   "event_id": "...:4",
   "method": "input.requested",
