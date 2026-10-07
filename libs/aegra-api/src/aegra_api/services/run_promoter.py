@@ -24,7 +24,7 @@ from aegra_api.services import run_limits
 from aegra_api.services.executor import executor
 from aegra_api.services.run_admission import find_promotable_runs
 from aegra_api.services.run_queue_signal import run_queue_signal
-from aegra_api.services.run_status import set_thread_status
+from aegra_api.services.run_status import set_thread_status_if_no_active_runs
 from aegra_api.services.webhook_service import send_run_webhook
 from aegra_api.settings import settings
 
@@ -135,7 +135,12 @@ class RunPromoter:
                 await session.rollback()
                 logger.debug("Overdue run already started or expired elsewhere", run_id=expired.run_id)
                 return
-            await set_thread_status(session, expired.thread_id, "error")
+            await set_thread_status_if_no_active_runs(
+                session,
+                [expired.thread_id],
+                "error",
+                user_id=expired.user_id,
+            )
             await session.commit()
         run_queue_signal.notify()
 

@@ -38,7 +38,7 @@ def terminal_calls(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMoc
     claim = AsyncMock(return_value=True)
     webhook = AsyncMock()
     monkeypatch.setattr(mod.run_limits, "claim_expired_run", claim)
-    monkeypatch.setattr(mod, "set_thread_status", AsyncMock())
+    monkeypatch.setattr(mod, "set_thread_status_if_no_active_runs", AsyncMock())
     monkeypatch.setattr(mod, "send_run_webhook", webhook)
     return claim, webhook
 
@@ -54,7 +54,13 @@ def _patch_lookups(
 
 
 def _expired(*, run_id: str = "run-1", webhook_url: str | None = WEBHOOK) -> ExpiredRun:
-    return ExpiredRun(run_id=run_id, thread_id="thread-1", org_id="7-z360", webhook_url=webhook_url)
+    return ExpiredRun(
+        run_id=run_id,
+        thread_id="thread-1",
+        user_id="user-1",
+        org_id="7-z360",
+        webhook_url=webhook_url,
+    )
 
 
 class TestPromotion:
@@ -106,7 +112,11 @@ class TestPromotion:
 
 class TestQueueExpiry:
     async def test_expired_run_is_failed_and_webhooked(
-        self, monkeypatch: pytest.MonkeyPatch, promote_calls: AsyncMock, terminal_calls: tuple
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        promote_calls: AsyncMock,
+        terminal_calls: tuple,
+        _session_maker: AsyncMock,
     ) -> None:
         claim, webhook = terminal_calls
         notify = MagicMock()
@@ -116,6 +126,12 @@ class TestQueueExpiry:
         await RunPromoter().tick()
 
         assert claim.await_args.kwargs["error"] == mod._QUEUE_EXPIRY_ERROR
+        mod.set_thread_status_if_no_active_runs.assert_awaited_once_with(
+            _session_maker,
+            ["thread-1"],
+            "error",
+            user_id="user-1",
+        )
         assert webhook.await_args.kwargs["status"] == "error"
         assert webhook.await_args.kwargs["webhook_url"] == WEBHOOK
         assert webhook.await_args.kwargs["error_message"] == mod._QUEUE_EXPIRY_ERROR

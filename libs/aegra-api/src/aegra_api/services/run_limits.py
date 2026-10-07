@@ -184,6 +184,7 @@ class ExpiredRun:
 
     run_id: str
     thread_id: str
+    user_id: str
     org_id: str | None
     webhook_url: str | None
 
@@ -200,7 +201,13 @@ async def find_expired_queued_runs(session: AsyncSession, *, batch_size: int) ->
     """
     cutoff = datetime.now(UTC) - timedelta(seconds=settings.run_limits.ORG_RUN_MAX_QUEUE_WAIT_SECONDS)
     stmt = (
-        select(RunORM.run_id, RunORM.thread_id, RunORM.org_id, RunORM.execution_params)
+        select(
+            RunORM.run_id,
+            RunORM.thread_id,
+            RunORM.user_id,
+            RunORM.org_id,
+            RunORM.execution_params,
+        )
         .where(
             RunORM.status == "pending",
             RunORM.claimed_by.is_(None),
@@ -215,10 +222,11 @@ async def find_expired_queued_runs(session: AsyncSession, *, batch_size: int) ->
         ExpiredRun(
             run_id=run_id,
             thread_id=thread_id,
+            user_id=user_id,
             org_id=org_id,
             webhook_url=_webhook_url_from(execution_params),
         )
-        for run_id, thread_id, org_id, execution_params in result.all()
+        for run_id, thread_id, user_id, org_id, execution_params in result.all()
     ]
 
 
