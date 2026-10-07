@@ -251,6 +251,28 @@ class TestPredecessorQuery:
 
 
 class TestFindPromotableRuns:
+    async def test_widens_scan_past_full_org_candidates(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
+        monkeypatch.setattr(settings.run_limits, "ORG_MAX_CONCURRENT_RUNS", 1)
+        blocked = [(f"full-{index}", ORG) for index in range(10)]
+        session = _session(
+            _result(rows=blocked),
+            _result(rows=[*blocked, ("eligible", "org-2")]),
+        )
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "active_counts_by_org",
+            AsyncMock(return_value={ORG: 1}),
+        )
+
+        result = await run_admission.find_promotable_runs(session, batch_size=1)
+
+        assert result == ["eligible"]
+        assert [call.args[1]["scan_limit"] for call in session.execute.await_args_list] == [10, 20]
+
     async def test_selects_enqueue_thread_heads_and_non_enqueue_runs(
         self,
         monkeypatch: pytest.MonkeyPatch,
