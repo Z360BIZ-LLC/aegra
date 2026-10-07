@@ -7,8 +7,8 @@ them.
 
 The gate lives on the ``pending -> running`` transition, which is the only
 place a run starts consuming capacity. Both executors route their claim
-through :func:`try_start_run`, so the policy holds in Redis worker mode and
-in-process dev mode alike.
+through :mod:`aegra_api.services.run_admission`, so the policy holds in Redis
+worker mode and in-process dev mode alike.
 
 Counting is derived from the runs table rather than an incrementing counter:
 a crashed worker's lease expires and the reaper resets its row, so a derived
@@ -18,7 +18,6 @@ Dependency-light on purpose (orm + settings + metrics only) so it can be
 imported from executors and API code without an import cycle.
 """
 
-import enum
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,15 +33,6 @@ from aegra_api.settings import settings
 # Two-argument advisory locks occupy a namespace of their own, so this can
 # never collide with the single-argument lock state_backfill takes.
 _ADVISORY_LOCK_NAMESPACE = 8471
-
-
-class ClaimOutcome(enum.Enum):
-    """Result of attempting to move a run from ``pending`` to ``running``."""
-
-    CLAIMED = "claimed"
-    # Another worker got there first, or the run is gone / no longer pending.
-    ALREADY_TAKEN = "already_taken"
-    AT_CAPACITY = "at_capacity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,40 +156,6 @@ async def evaluate(session: AsyncSession, org_id: str) -> LimitDecision:
     """Measure one org's capacity. Caller must already hold the org lock."""
     active = await count_active_runs(session, org_id)
     return LimitDecision(org_id=org_id, active=active, limit=limit_for(org_id))
-
-
-async def try_start_run(
-    session: AsyncSession,
-    run_id: str,
-    *,
-    claimed_by: str | None = None,
-    lease_expires_at: datetime | None = None,
-) -> ClaimOutcome:
-    """Compatibility adapter until executors import run_admission directly."""
-    # Deferred to avoid the run_admission -> run_limits import cycle.
-    from aegra_api.services.run_admission import (
-        AdmissionOutcome,
-    )
-    from aegra_api.services.run_admission import (
-        try_start_run as admit,
-    )
-
-    outcome = await admit(
-        session,
-        run_id,
-        claimed_by=claimed_by,
-        lease_expires_at=lease_expires_at,
-    )
-    if outcome is AdmissionOutcome.CLAIMED:
-        return ClaimOutcome.CLAIMED
-    if outcome in (
-        AdmissionOutcome.THREAD_BLOCKED,
-        AdmissionOutcome.ORG_AT_CAPACITY,
-    ):
-        return ClaimOutcome.AT_CAPACITY
-    if outcome is AdmissionOutcome.ALREADY_TAKEN:
-        return ClaimOutcome.ALREADY_TAKEN
-    raise AssertionError(f"Unhandled admission outcome: {outcome}")
 
 
 async def active_counts_by_org(session: AsyncSession) -> dict[str, int]:

@@ -11,7 +11,7 @@ from redis import TimeoutError as RedisTimeoutError
 from aegra_api.core.active_runs import active_runs, explicit_run_cancellations
 from aegra_api.models.auth import User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
-from aegra_api.services import run_limits
+from aegra_api.services.run_admission import AdmissionOutcome
 from aegra_api.services.run_executor import _shutdown_cancellations, _timeout_cancellations
 from aegra_api.services.worker_executor import (
     WorkerExecutor,
@@ -115,24 +115,30 @@ class TestIsValidRunId:
 
 class TestCapacityGate:
     @pytest.mark.asyncio
-    async def test_run_held_at_org_limit_is_not_loaded(self) -> None:
-        """At capacity the run stays pending — the promoter owns it now."""
+    @pytest.mark.parametrize(
+        "outcome",
+        [AdmissionOutcome.THREAD_BLOCKED, AdmissionOutcome.ORG_AT_CAPACITY],
+    )
+    async def test_blocked_run_is_committed_but_not_loaded(
+        self,
+        outcome: AdmissionOutcome,
+    ) -> None:
+        """Blocked-reason changes commit so the promoter can observe them."""
         session = AsyncMock()
-        session.rollback = AsyncMock()
         maker = _make_session_maker(session)
 
         with (
             patch(f"{MODULE}._get_session_maker", return_value=maker),
             patch(
-                f"{MODULE}.run_limits.try_start_run",
-                AsyncMock(return_value=run_limits.ClaimOutcome.AT_CAPACITY),
+                f"{MODULE}.try_start_run",
+                AsyncMock(return_value=outcome),
             ),
         ):
             result = await _acquire_and_load("run-1", "worker-1")
 
         assert result is None
-        session.rollback.assert_awaited_once()
-        session.commit.assert_not_awaited()
+        session.commit.assert_awaited_once()
+        session.rollback.assert_not_awaited()
 
 
 class TestAcquireAndLoad:
@@ -147,8 +153,8 @@ class TestAcquireAndLoad:
         with (
             patch(f"{MODULE}._get_session_maker", return_value=maker),
             patch(
-                f"{MODULE}.run_limits.try_start_run",
-                AsyncMock(return_value=run_limits.ClaimOutcome.CLAIMED),
+                f"{MODULE}.try_start_run",
+                AsyncMock(return_value=AdmissionOutcome.CLAIMED),
             ),
         ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
@@ -168,14 +174,15 @@ class TestAcquireAndLoad:
         with (
             patch(f"{MODULE}._get_session_maker", return_value=maker),
             patch(
-                f"{MODULE}.run_limits.try_start_run",
-                AsyncMock(return_value=run_limits.ClaimOutcome.ALREADY_TAKEN),
+                f"{MODULE}.try_start_run",
+                AsyncMock(return_value=AdmissionOutcome.ALREADY_TAKEN),
             ),
         ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
 
         assert result is None
         session.rollback.assert_awaited_once()
+        session.commit.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_none_when_execution_params_is_none(self) -> None:
@@ -190,8 +197,8 @@ class TestAcquireAndLoad:
         with (
             patch(f"{MODULE}._get_session_maker", return_value=maker),
             patch(
-                f"{MODULE}.run_limits.try_start_run",
-                AsyncMock(return_value=run_limits.ClaimOutcome.CLAIMED),
+                f"{MODULE}.try_start_run",
+                AsyncMock(return_value=AdmissionOutcome.CLAIMED),
             ),
         ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
@@ -832,6 +839,29 @@ class TestExecuteAndRelease:
 
 
 class TestExecuteWithLease:
+    @pytest.mark.asyncio
+    async def test_duplicate_deliveries_execute_only_claimed_copy(self) -> None:
+        run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        executor = WorkerExecutor()
+        loaded = _LoadedRun(_make_run_job(), {})
+        execute = AsyncMock()
+
+        with (
+            patch(
+                f"{MODULE}._acquire_and_load",
+                new_callable=AsyncMock,
+                side_effect=[loaded, None],
+            ),
+            patch(f"{MODULE}._restore_trace_context"),
+            patch(f"{MODULE}.execute_run", execute),
+            patch(f"{MODULE}._heartbeat_loop", new_callable=AsyncMock),
+            patch(f"{MODULE}._release_lease", new_callable=AsyncMock),
+        ):
+            await executor._execute_with_lease(run_id, "worker-0")
+            await executor._execute_with_lease(run_id, "worker-1")
+
+        execute.assert_awaited_once_with(loaded.job)
+
     @pytest.mark.asyncio
     async def test_cancels_job_task_in_finally(self) -> None:
         """Regression: when _execute_with_lease is cancelled (e.g. by wait_for

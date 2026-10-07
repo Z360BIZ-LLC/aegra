@@ -30,6 +30,7 @@ from aegra_api.models.run_job import RunJob
 from aegra_api.observability.span_enrichment import merge_run_metadata, set_trace_context
 from aegra_api.services import run_limits
 from aegra_api.services.base_executor import BaseExecutor
+from aegra_api.services.run_admission import AdmissionOutcome, try_start_run
 from aegra_api.services.run_executor import (
     _lease_loss_cancellations,
     _shutdown_cancellations,
@@ -466,17 +467,20 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
     async with maker() as session:
         # try_start_run holds an org advisory lock for the rest of this
         # transaction, so the capacity check it made cannot go stale.
-        outcome = await run_limits.try_start_run(
+        outcome = await try_start_run(
             session,
             run_id,
             claimed_by=worker_name,
             lease_expires_at=lease_until,
         )
-        if outcome is not run_limits.ClaimOutcome.CLAIMED:
-            # AT_CAPACITY leaves the run pending on purpose — the promoter
-            # re-dispatches it when the org frees a slot. Re-enqueueing here
-            # would spin the worker on a run it cannot start.
+        if outcome is AdmissionOutcome.ALREADY_TAKEN:
             await session.rollback()
+            return None
+        if outcome in (
+            AdmissionOutcome.THREAD_BLOCKED,
+            AdmissionOutcome.ORG_AT_CAPACITY,
+        ):
+            await session.commit()
             return None
 
         run_orm = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))

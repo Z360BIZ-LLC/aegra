@@ -8,8 +8,8 @@ import pytest
 from aegra_api.models.auth import User
 from aegra_api.models.run_job import RunExecution, RunIdentity, RunJob
 from aegra_api.services import local_executor as local_executor_module
-from aegra_api.services import run_limits
 from aegra_api.services.local_executor import LocalExecutor
+from aegra_api.services.run_admission import AdmissionOutcome
 from aegra_api.settings import settings
 
 
@@ -33,6 +33,12 @@ class TestLocalExecutor:
         mock_execute = AsyncMock()
 
         with (
+            patch.object(
+                executor,
+                "_claim",
+                new_callable=AsyncMock,
+                return_value=AdmissionOutcome.CLAIMED,
+            ),
             patch("aegra_api.services.run_executor.execute_run", mock_execute),
             patch("aegra_api.services.local_executor.make_run_trace_context", return_value=None),
         ):
@@ -47,13 +53,20 @@ class TestLocalExecutor:
             task.cancel()
 
     @pytest.mark.asyncio
-    async def test_submit_leaves_run_queued_when_org_is_at_capacity(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Over-limit runs stay pending for the promoter — never dropped."""
-        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
+    @pytest.mark.parametrize(
+        "outcome",
+        [AdmissionOutcome.THREAD_BLOCKED, AdmissionOutcome.ORG_AT_CAPACITY],
+    )
+    async def test_submit_leaves_blocked_run_queued(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: AdmissionOutcome,
+    ) -> None:
+        """Thread- and org-blocked runs stay pending for the promoter."""
         monkeypatch.setattr(
             LocalExecutor,
             "_claim",
-            AsyncMock(return_value=False),
+            AsyncMock(return_value=outcome),
         )
         executor = LocalExecutor()
 
@@ -66,8 +79,11 @@ class TestLocalExecutor:
 
     @pytest.mark.asyncio
     async def test_submit_starts_run_when_capacity_is_available(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
-        monkeypatch.setattr(LocalExecutor, "_claim", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            LocalExecutor,
+            "_claim",
+            AsyncMock(return_value=AdmissionOutcome.CLAIMED),
+        )
         executor = LocalExecutor()
 
         with (
@@ -89,25 +105,84 @@ class TestLocalExecutor:
         counting against its org, and wedges the whole tenant rather than
         losing a single run.
         """
-        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
         session = AsyncMock()
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=session)
         ctx.__aexit__ = AsyncMock(return_value=False)
         monkeypatch.setattr(local_executor_module, "_get_session_maker", lambda: MagicMock(return_value=ctx))
-        try_start = AsyncMock(return_value=run_limits.ClaimOutcome.CLAIMED)
-        monkeypatch.setattr(run_limits, "try_start_run", try_start)
+        try_start = AsyncMock(return_value=AdmissionOutcome.CLAIMED)
+        monkeypatch.setattr(local_executor_module, "try_start_run", try_start)
 
-        assert await LocalExecutor()._claim("run-1") is True
+        assert await LocalExecutor()._claim("run-1") is AdmissionOutcome.CLAIMED
 
         kwargs = try_start.await_args.kwargs
         assert kwargs["claimed_by"], "a local run must record an owner"
         assert kwargs["lease_expires_at"] is not None, "a local run must record a lease expiry"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome", "commits", "rolls_back"),
+        [
+            (AdmissionOutcome.THREAD_BLOCKED, True, False),
+            (AdmissionOutcome.ORG_AT_CAPACITY, True, False),
+            (AdmissionOutcome.ALREADY_TAKEN, False, True),
+        ],
+    )
+    async def test_claim_finishes_admission_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: AdmissionOutcome,
+        commits: bool,
+        rolls_back: bool,
+    ) -> None:
+        session = AsyncMock()
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            local_executor_module,
+            "_get_session_maker",
+            lambda: MagicMock(return_value=ctx),
+        )
+        monkeypatch.setattr(
+            local_executor_module,
+            "try_start_run",
+            AsyncMock(return_value=outcome),
+        )
+
+        assert await LocalExecutor()._claim("run-1") is outcome
+        assert bool(session.commit.await_count) is commits
+        assert bool(session.rollback.await_count) is rolls_back
+
+    @pytest.mark.asyncio
+    async def test_spawn_keeps_lease_when_org_limits_are_off(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "off")
+        executor = LocalExecutor()
+        keep_lease = AsyncMock()
+        monkeypatch.setattr(executor, "_keep_lease", keep_lease)
+
+        with (
+            patch("aegra_api.services.run_executor.execute_run", AsyncMock()),
+            patch(
+                "aegra_api.services.local_executor.make_run_trace_context",
+                return_value=None,
+            ),
+        ):
+            executor._spawn(_make_job("run-leased"))
+            await asyncio.sleep(0)
+
+        keep_lease.assert_awaited_once()
+        from aegra_api.core.active_runs import active_runs
+
+        active_runs.pop("run-leased").cancel()
+
+    @pytest.mark.asyncio
     async def test_promote_skips_run_without_execution_params(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(LocalExecutor, "_load_job", AsyncMock(return_value=None))
-        claim = AsyncMock(return_value=True)
+        claim = AsyncMock(return_value=AdmissionOutcome.CLAIMED)
         monkeypatch.setattr(LocalExecutor, "_claim", claim)
 
         await LocalExecutor().promote("run-missing")
@@ -132,10 +207,17 @@ class TestLocalExecutor:
         active_runs.pop("run-done", None)
 
     @pytest.mark.asyncio
-    async def test_wait_for_completion_returns_on_missing_run(self) -> None:
+    async def test_wait_for_completion_polls_queued_run_until_terminal(self) -> None:
         executor = LocalExecutor()
-        # Should return immediately, not raise
-        await executor.wait_for_completion("nonexistent", timeout=1.0)
+        terminal = AsyncMock(side_effect=[False, False, True])
+
+        with (
+            patch("aegra_api.services.local_executor._is_run_terminal", terminal),
+            patch("aegra_api.services.local_executor.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await executor.wait_for_completion("run-queued", timeout=1.0)
+
+        assert terminal.await_count == 3
 
     @pytest.mark.asyncio
     async def test_stop_cancels_active_tasks(self) -> None:
