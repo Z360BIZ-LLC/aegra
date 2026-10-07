@@ -30,6 +30,22 @@ def upgrade() -> None:
             nullable=False,
         ),
     )
+    # Preserve the strategy that created historical rows when execution
+    # parameters contain it. Rows from older releases have no such value and
+    # adopt the new Agent Protocol default.
+    op.execute(
+        sa.text(
+            """
+            UPDATE runs
+               SET multitask_strategy = CASE
+                   WHEN execution_params #>> '{behavior,multitask_strategy}'
+                        IN ('reject', 'interrupt', 'rollback', 'enqueue')
+                   THEN execution_params #>> '{behavior,multitask_strategy}'
+                   ELSE 'enqueue'
+               END
+            """
+        )
+    )
     op.add_column("runs", sa.Column("queue_position", sa.BigInteger(), nullable=True))
     op.add_column("runs", sa.Column("pending_reason", sa.Text(), nullable=True))
     op.add_column(

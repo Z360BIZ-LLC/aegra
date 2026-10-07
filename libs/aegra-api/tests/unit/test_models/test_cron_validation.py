@@ -89,6 +89,26 @@ class TestOnRunCompletedLiteral:
         assert req.on_run_completed == value
 
 
+class TestMultitaskStrategyLiteral:
+    @pytest.mark.parametrize("model", [CronCreate, CronUpdate])
+    def test_rejects_unknown_strategy(self, model: type[CronCreate] | type[CronUpdate]) -> None:
+        kwargs = {"multitask_strategy": "race"}
+        if model is CronCreate:
+            kwargs.update(input={"q": 1}, assistant_id="a", schedule="* * * * *")
+        with pytest.raises(ValidationError, match="multitask_strategy"):
+            model(**kwargs)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("value", ["reject", "interrupt", "rollback", "enqueue"])
+    def test_accepts_agent_protocol_strategies(self, value: str) -> None:
+        request = CronCreate(
+            input={"q": 1},
+            assistant_id="a",
+            schedule="* * * * *",
+            multitask_strategy=value,  # type: ignore[arg-type]
+        )
+        assert request.multitask_strategy == value
+
+
 class TestMaxLengthGuards:
     def test_rejects_oversized_schedule(self) -> None:
         with pytest.raises(ValidationError):

@@ -46,6 +46,8 @@ class TestRunAdmissionMigration:
 
         assert "CREATE SEQUENCE runs_queue_position_seq" in sql
         assert "ADD COLUMN multitask_strategy TEXT DEFAULT 'enqueue' NOT NULL" in sql
+        assert "execution_params #>> '{behavior,multitask_strategy}'" in sql
+        assert "IN ('reject', 'interrupt', 'rollback', 'enqueue')" in sql
         assert "ADD COLUMN queue_position BIGINT" in sql
         assert "row_number() OVER (ORDER BY created_at, run_id)" in sql
         assert "SELECT setval(" in sql
