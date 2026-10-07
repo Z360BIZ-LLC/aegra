@@ -3,7 +3,7 @@
   "info": {
     "title": "Aegra",
     "description": "Production-ready Agent Protocol server",
-    "version": "0.10.6"
+    "version": "0.10.7"
   },
   "paths": {
     "/info": {
@@ -1574,7 +1574,7 @@
           "Threads"
         ],
         "summary": "Search Threads",
-        "description": "Search threads with filters.\n\nFilter by status or metadata key-value pairs. Results are paginated via\n`limit` and `offset` and ordered by creation time (newest first).",
+        "description": "Search threads with filters.\n\nFilter by status, metadata, or thread `ids`; paginate via `limit`/`offset`.\nPass `select` to project the returned fields and `extract` to pull JSON\npaths out of state/metadata into an `extracted` field (see issue #330).\nWithout `select`/`extract` the full thread shape is returned, unchanged.",
         "operationId": "search_threads_threads_search_post",
         "requestBody": {
           "content": {
@@ -1591,13 +1591,7 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/Thread"
-                  },
-                  "type": "array",
-                  "title": "Response Search Threads Threads Search Post"
-                }
+                "schema": {}
               }
             }
           },
@@ -4644,6 +4638,18 @@
             "format": "date-time",
             "title": "Updated At",
             "description": "Timestamp when the run was last updated."
+          },
+          "multitask_strategy": {
+            "type": "string",
+            "enum": [
+              "reject",
+              "interrupt",
+              "rollback",
+              "enqueue"
+            ],
+            "title": "Multitask Strategy",
+            "description": "Effective strategy for handling concurrent runs on the same thread.",
+            "default": "enqueue"
           }
         },
         "type": "object",
@@ -4772,7 +4778,13 @@
           "multitask_strategy": {
             "anyOf": [
               {
-                "type": "string"
+                "type": "string",
+                "enum": [
+                  "reject",
+                  "interrupt",
+                  "rollback",
+                  "enqueue"
+                ]
               },
               {
                 "type": "null"
@@ -4855,6 +4867,18 @@
             ],
             "title": "Metadata",
             "description": "Request metadata propagated to OTEL trace attributes (``langfuse.trace.metadata.<key>``).  Keys must match ``[A-Za-z0-9_-]{1,64}``.  Values must be primitive (``str``, ``int``, ``float``, ``bool``); string values are capped at 512 characters.  Maximum 32 keys.  Use this for filterable attributes (tenant, feature flag, environment, sub-agent type) rather than payload data."
+          },
+          "webhook": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook",
+            "description": "Webhook URL to POST run results to when execution completes, fails, or is cancelled."
           }
         },
         "type": "object",
@@ -5535,6 +5559,12 @@
             "title": "Pruned",
             "description": "Expired threads whose history was pruned (strategy 'keep_latest')",
             "default": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "title": "Skipped",
+            "description": "Expired threads left untouched because they use a DeltaChannel, whose value cannot be reconstructed once intermediate checkpoints are dropped",
+            "default": 0
           }
         },
         "type": "object",
@@ -5644,6 +5674,64 @@
             ],
             "title": "Sort Order",
             "description": "Sort direction (SDK-compatible). Defaults to 'desc' when sort_by is set."
+          },
+          "ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ids",
+            "description": "Restrict results to these thread IDs."
+          },
+          "select": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Select",
+            "description": "Fields to include in each result. Supported: thread_id, status, created_at, updated_at, metadata, values, interrupts. Absent = full thread."
+          },
+          "extract": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extract",
+            "description": "Alias -> JSON path (e.g. 'values.messages[-1].content'). Path root must be values/metadata/config/interrupts; max 10. Unresolved paths yield null. Results in 'extracted'."
+          },
+          "values": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Values",
+            "description": "SDK state-value filter \u2014 not supported; a non-empty value returns 422."
           }
         },
         "type": "object",

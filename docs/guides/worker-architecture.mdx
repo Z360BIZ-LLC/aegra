@@ -3,7 +3,11 @@ title: "Worker architecture"
 description: "How Aegra dispatches, executes, and recovers agent runs at scale."
 ---
 
-Aegra uses a worker-based execution model for production deployments. Runs are dispatched through a Redis job queue and executed by concurrent asyncio workers across any number of instances. Lease-based crash recovery ensures no run is lost, even if an instance dies mid-execution.
+Aegra uses a worker-based execution model for production deployments. Runs are
+persisted in PostgreSQL, dispatched through a Redis delivery queue, and
+executed by concurrent asyncio workers across any number of instances. Atomic
+PostgreSQL admission and lease-based crash recovery ensure same-thread runs do
+not overlap and no queued run depends on one process staying alive.
 
 In dev mode (`aegra dev`), none of this is needed — runs execute as simple in-process asyncio tasks.
 
@@ -24,9 +28,10 @@ flowchart TD
     Broker["SSE Broker"]
 
     Client -->|POST /runs| API
-    API -->|persist + enqueue| Redis
+    API -->|delivery hint| Redis
+    API -->|persist queue position| PG
     Redis -->|BLPOP| Worker
-    Worker -->|lease + execute + finalize| PG
+    Worker -->|admit + lease + execute + finalize| PG
     Worker -->|PUBLISH events| PubSub
     PubSub -->|subscribe| Broker
     Broker -->|SSE stream| Client
@@ -43,14 +48,51 @@ flowchart TD
 The happy path of a single run, step by step:
 
 1. **Client** sends a run request to any instance via the load balancer.
-2. **FastAPI** validates, persists the run to PostgreSQL (with serialized execution params), and pushes the run ID onto the Redis job queue.
+2. **FastAPI** validates and persists the run to PostgreSQL with serialized
+   execution params, its multitask strategy, and a monotonic queue position,
+   then pushes the run ID onto the Redis delivery queue.
 3. **Worker** picks up the job via `BLPOP` (blocking pop — instant delivery, no polling).
-4. **Worker** acquires an exclusive lease in PostgreSQL, executes the graph, heartbeats every 10s, and finalizes the run (status, output, release lease).
+4. **Worker** atomically checks thread FIFO order and organization capacity in
+   PostgreSQL. An admitted run acquires a lease, executes the graph, heartbeats
+   every 10s, and finalizes its status and output. A blocked run remains
+   `pending` for the promoter to dispatch later.
 5. **Worker** publishes each event to Redis Pub/Sub for real-time streaming.
 6. **SSE Broker** subscribes to Redis Pub/Sub and relays events.
 7. **Client** receives events over an SSE connection.
 
-Behind the scenes, the **Lease Reaper** scans PostgreSQL every 15 seconds for runs with expired leases (crashed workers) and re-enqueues them. Workers also send **OpenTelemetry traces** to Langfuse, Phoenix, or any OTLP collector.
+Behind the scenes, the **Lease Reaper** scans PostgreSQL every 15 seconds for
+runs with expired leases and resets recoverable work to `pending`. The
+**Run Promoter** dispatches eligible thread heads, including recovered work and
+jobs whose Redis delivery hint was lost. Workers also send **OpenTelemetry
+traces** to Langfuse, Phoenix, or any OTLP collector.
+
+## Durable enqueue admission
+
+For stateful runs, `enqueue` is the default multitask strategy, including when
+the request omits the field or sends `null`. PostgreSQL is the authoritative
+queue: each run stores its strategy, queue position, execution parameters, and
+optional pending reason. Redis only accelerates delivery.
+
+Every executor delivery passes through the same admission transaction:
+
+1. Acquire a transaction-scoped advisory lock for the thread.
+2. Reject duplicate or already-terminal delivery attempts.
+3. For `enqueue`, keep the run pending while any older pending or running run
+   exists on that thread.
+4. Apply the per-organization capacity gate, when enabled.
+5. Atomically change the winner from `pending` to `running` and assign its
+   lease.
+
+This gate is used by both `LocalExecutor` and `WorkerExecutor`, so development
+and production have the same FIFO semantics. Completion, error, interruption,
+cancellation, deletion, and lease recovery signal the promoter. The promoter
+then selects only durable queue heads and rechecks admission before execution.
+Because every replica uses the same PostgreSQL locks and predicates, duplicate
+Redis deliveries and concurrent promoters are safe.
+
+An explicit checkpoint remains part of the persisted execution parameters. A
+queued branch therefore executes from the checkpoint requested by its caller;
+it is not rebased onto a predecessor's newer state.
 
 ## Horizontal scaling
 
@@ -112,7 +154,8 @@ sequenceDiagram
     W->>R: BLPOP (blocks until job)
     R->>W: run_id
     W->>W: semaphore.acquire()
-    W->>PG: UPDATE claimed_by, lease_expires_at
+    W->>PG: advisory-lock thread + check predecessor/capacity
+    W->>PG: UPDATE status=running, claimed_by, lease_expires_at
     W->>PG: SELECT execution_params
     W->>W: Restore trace context
 
@@ -137,7 +180,9 @@ sequenceDiagram
 Key details:
 
 1. **Execution params** are stored in PostgreSQL alongside the run, so any worker can reconstruct the full job context (user identity, config, trace metadata, interrupt settings, etc.).
-2. **Lease acquisition** is atomic — `UPDATE ... WHERE claimed_by IS NULL` ensures only one worker wins the race.
+2. **Admission and lease acquisition** are atomic. A thread advisory lock plus
+   a predecessor query enforces FIFO, while the conditional status update
+   makes duplicate deliveries harmless.
 3. **Heartbeats** extend the lease every 10 seconds. If a worker crashes, the lease expires and the run becomes eligible for recovery.
 4. **OpenTelemetry trace context** propagates across the Redis queue boundary, so traces span the full request lifecycle.
 
@@ -181,14 +226,15 @@ sequenceDiagram
     DB-->>Reaper: crashed_run_ids
     Reaper->>DB: UPDATE status=pending, claimed_by=NULL WHERE status=running AND lease_expires_at < now
     Reaper->>DB: increment _retry_count in execution_params
-    Reaper->>Redis: RPUSH run_id (re-enqueue for another worker)
+    Reaper->>DB: signal durable queue transition
+    Note over Reaper,Redis: Run Promoter later dispatches the eligible thread head
 ```
 
 ## Crash recovery
 
 Every instance runs a `LeaseReaper` background task that scans for runs with expired leases.
 When a worker crashes (OOM, kill signal, network partition), its heartbeat stops and the lease expires.
-The reaper resets the run to `pending` and re-enqueues it.
+The reaper resets the run to `pending` and signals the promoter.
 The new worker resumes from the last checkpoint.
 Once retries are exhausted, the reaper marks the run `error`, clears ownership, and marks the thread `error` in the same transaction when no other run is active.
 
@@ -199,6 +245,7 @@ sequenceDiagram
     participant WA as Worker A
     participant PG as PostgreSQL
     participant Reaper as Reaper (on B)
+    participant Promoter as Run Promoter
     participant R as Redis
     participant WB as Worker B
 
@@ -214,7 +261,9 @@ sequenceDiagram
     Reaper->>PG: SELECT WHERE status=running AND lease < now()
     PG->>Reaper: Found expired run!
     Reaper->>PG: UPDATE status=pending, clear lease
-    Reaper->>R: RPUSH run_id (re-enqueue)
+    Reaper->>Promoter: Signal queue transition
+    Promoter->>PG: Select eligible durable queue head
+    Promoter->>R: RPUSH run_id
 
     WB->>R: BLPOP
     R->>WB: run_id
@@ -223,14 +272,18 @@ sequenceDiagram
     WB->>PG: UPDATE status=success
 ```
 
-The reaper runs on every instance (default every 15 seconds). This is safe — the atomic lease acquisition prevents duplicate execution.
+The reaper and promoter run on every instance. This is safe: PostgreSQL
+admission prevents duplicate execution and preserves the recovered run's
+original queue position, so it cannot jump ahead of an older predecessor.
 
 ## Graceful shutdown
 
-On SIGTERM (rolling deploy, pod reschedule, node drain) the executor waits up to `WORKER_DRAIN_TIMEOUT` (default 30s) for in-flight runs to finish. Runs still executing when the window closes are **handed back to the queue**, not finalized: the run is reset to `pending` with its lease cleared and re-enqueued, so another instance resumes it from the last checkpoint — the same guarantee the crash path provides. Clients streaming the run stay connected and pick up events from the resuming worker.
+On SIGTERM (rolling deploy, pod reschedule, node drain) the executor waits up to `WORKER_DRAIN_TIMEOUT` (default 30s) for in-flight runs to finish. Runs still executing when the window closes are **handed back to the queue**, not finalized: the run is reset to `pending` with its lease cleared and signaled for promotion, so another instance resumes it from the last checkpoint — the same guarantee the crash path provides. Clients streaming the run stay connected and pick up events from the resuming worker.
 
 - A user-initiated cancel that races the shutdown still wins: explicitly cancelled runs are finalized as `interrupted`, never resurrected.
-- If Redis is unreachable during the hand-off, the rows are already `pending` and unclaimed, so a surviving instance's reaper re-enqueues them after `STUCK_PENDING_THRESHOLD_SECONDS`.
+- If Redis is unreachable during the hand-off, the rows are already `pending`
+  and unclaimed. A surviving promoter discovers them from PostgreSQL after
+  `STUCK_PENDING_THRESHOLD_SECONDS` and retries delivery.
 - Drain hand-offs do not consume the crash retry budget (`BG_JOB_MAX_RETRIES`).
 
 Set your orchestrator's grace period a few seconds above `WORKER_DRAIN_TIMEOUT` (on Kubernetes: `terminationGracePeriodSeconds`), so the requeue completes before the pod is killed. Runs longer than the drain window survive the deploy either way; the timeout only decides how long the old pod waits before handing them off.
@@ -296,10 +349,12 @@ cap how many runs one organization may execute at once, across every graph.
 Over-limit runs are **never rejected**. The runs table is already the queue of
 record, so a run held at the ceiling simply stays `pending` until a slot frees:
 
-1. The run is created and enqueued exactly as usual.
-2. A worker picks it up and attempts the claim. The claim takes a
-   transaction-scoped advisory lock on the org, counts its active runs, and
-   refuses the `pending → running` transition when the org is full.
+1. The run is created and assigned its durable queue position exactly as
+   usual.
+2. A worker picks it up and attempts admission. The transaction locks the
+   thread first, then the organization, counts active runs, and refuses the
+   `pending → running` transition when either an older same-thread run exists
+   or the organization is full.
 3. The run stays `pending`. The worker moves on rather than spinning on it.
 4. `RunPromoter` watches for freed capacity and re-dispatches the oldest queued
    run for each org, oldest-first and fairly across orgs.
@@ -310,13 +365,9 @@ anonymous bucket, which would let one caller starve the quota for everyone.
 
 Capacity is counted from the runs table rather than an incrementing counter: a
 crashed worker's lease expires and the reaper resets its row, so the count
-self-heals where a counter would leak a slot permanently.
-
-<Note>
-  While limits are enforcing, the lease reaper's stuck-pending sweep is
-  disabled — it has no capacity check and would re-enqueue runs the promoter is
-  deliberately holding. The promoter covers that case instead.
-</Note>
+self-heals where a counter would leak a slot permanently. The promoter applies
+both thread-head eligibility and projected organization capacity, preserving
+FIFO without letting one full organization consume every promotion batch.
 
 <Warning>
   A queued run holds its caller's SSE or `/join` connection open (keepalives
@@ -335,8 +386,8 @@ self-heals where a counter would leak a slot permanently.
 | `ORG_RUN_PROMOTER_INTERVAL_SECONDS` | `2.0` | How often freed capacity is checked |
 | `ORG_RUN_PROMOTER_BATCH_SIZE` | `100` | Runs dispatched per promoter pass |
 
-Both executors route their claim through `run_limits.try_start_run`, so the
-policy holds in dev mode as well as production.
+Both executors route their claim through `run_admission.try_start_run`, so the
+thread and organization policies hold in dev mode as well as production.
 
 ## Redis data layout
 
@@ -361,7 +412,7 @@ All worker settings are configured via environment variables. See the [environme
 | `N_JOBS_PER_WORKER` | `10` | Concurrent runs per worker loop |
 | `BG_JOB_TIMEOUT_SECS` | `3600` | Max execution time per run (1 hour) |
 | `BG_JOB_MAX_RETRIES` | `3` | Max retry attempts before a crashed run is permanently failed |
-| `STUCK_PENDING_THRESHOLD_SECONDS` | `120` | How long a pending run can sit before the reaper re-enqueues it |
+| `STUCK_PENDING_THRESHOLD_SECONDS` | `120` | Age after which the promoter treats an unmarked pending row as needing delivery recovery |
 | `LEASE_DURATION_SECONDS` | `30` | Lease TTL before reaper reclaims |
 | `HEARTBEAT_INTERVAL_SECONDS` | `10` | Lease extension frequency |
 | `REAPER_INTERVAL_SECONDS` | `15` | Expired lease scan frequency |
@@ -384,8 +435,10 @@ All worker settings are configured via environment variables. See the [environme
 | `services/run_status.py` | Database status updates |
 | `services/run_preparation.py` | Run creation (validate, persist, submit) |
 | `services/lease_reaper.py` | Background task recovering crashed worker runs |
-| `services/run_limits.py` | Per-organization concurrency policy and capacity-gated claim |
-| `services/run_promoter.py` | Dispatches queued runs as org capacity frees; expires overdue ones |
+| `services/run_admission.py` | Atomic thread-FIFO and organization-capacity admission; durable queue-head selection |
+| `services/run_limits.py` | Per-organization limits, capacity calculations, and queue expiry |
+| `services/run_promoter.py` | Dispatches eligible durable queue heads and expires overdue org-blocked runs |
+| `services/run_queue_signal.py` | In-process wake-up signal for committed queue transitions |
 | `services/broker.py` | In-memory broker + factory |
 | `services/redis_broker.py` | Redis pub/sub broker for SSE |
 | `services/streaming_service.py` | SSE orchestration (replay + live) |

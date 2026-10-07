@@ -41,6 +41,8 @@ description: "What Aegra supports today, what's coming soon, and what's not yet 
 | Sync wait | Supported | Block until run completes and return final output. |
 | Subgraph streaming | Supported | Stream events from nested subgraphs. |
 | Stateless runs | Supported | Execute without persisting thread state. |
+| Enqueue multitask strategy | Supported | The default for stateful runs. Executes one run per thread in durable FIFO order. |
+| Reject / interrupt / rollback strategies | Not yet planned | Accepted for protocol compatibility but do not yet alter scheduling behavior. Use `enqueue`. |
 | Cron / scheduled jobs | Supported | Trigger runs on a schedule. Standard and seconds-level cron expressions. IANA timezone support. |
 
 ### Scaling and reliability
