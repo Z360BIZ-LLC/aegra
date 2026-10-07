@@ -45,6 +45,14 @@ def test_exactly_one_head() -> None:
     assert len(heads) == 1, f"expected a single alembic head, found {len(heads)}: {named}"
 
 
+def test_run_admission_revision_is_head() -> None:
+    down_by_rev, _ = _load_chain()
+    parents = {down for down in down_by_rev.values() if down is not None}
+    heads = {rev for rev in down_by_rev if rev not in parents}
+
+    assert heads == {"d4e8f2a1b6c9"}
+
+
 def test_exactly_one_base() -> None:
     down_by_rev, file_by_rev = _load_chain()
     bases = sorted(rev for rev, down in down_by_rev.items() if down is None)

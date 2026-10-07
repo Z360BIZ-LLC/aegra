@@ -69,6 +69,20 @@ class TestRunCreateValidation:
 
         assert run.multitask_strategy == "enqueue"
 
+    def test_run_response_normalizes_unloaded_server_default(self) -> None:
+        run = Run(
+            run_id="run-1",
+            thread_id="thread-1",
+            assistant_id="agent",
+            input={},
+            user_id="user-1",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            multitask_strategy=None,  # type: ignore[arg-type]
+        )
+
+        assert run.multitask_strategy == "enqueue"
+
 
 class TestRunCreateMetadataValidation:
     """Tests for ``RunCreate.metadata`` shape enforcement.

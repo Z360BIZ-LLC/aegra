@@ -192,6 +192,12 @@ class Run(BaseModel):
             raise ValueError(f"Status must be a string, got {type(v)}")
         return validate_run_status(v)
 
+    @field_validator("multitask_strategy", mode="before")
+    @classmethod
+    def default_multitask_strategy(cls, value: object) -> object:
+        """Normalize an unloaded database server default for legacy rows."""
+        return "enqueue" if value is None else value
+
 
 class RunStatus(BaseModel):
     """Simple run status response"""
