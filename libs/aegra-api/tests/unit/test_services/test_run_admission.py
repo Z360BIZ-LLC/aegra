@@ -1,0 +1,244 @@
+"""Unit tests for durable thread and organization run admission."""
+
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from aegra_api.services import run_admission
+from aegra_api.services.run_admission import AdmissionOutcome, try_start_run
+from aegra_api.services.run_limits import LimitDecision
+from aegra_api.settings import settings
+
+ORG = "org-1"
+RUN_ID = "run-1"
+THREAD_ID = "thread-1"
+
+
+def _result(*, first: object = None, rowcount: int = 1) -> MagicMock:
+    result = MagicMock()
+    result.first.return_value = first
+    result.rowcount = rowcount
+    return result
+
+
+def _session(*results: MagicMock) -> AsyncMock:
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=results)
+    return session
+
+
+def _run_row(
+    *,
+    status: str = "pending",
+    claimed_by: str | None = None,
+    strategy: str = "enqueue",
+    org_id: str | None = None,
+    pending_reason: str | None = None,
+) -> tuple[str, str | None, str, str | None, str, int, str | None]:
+    return (
+        THREAD_ID,
+        org_id,
+        status,
+        claimed_by,
+        strategy,
+        2,
+        pending_reason,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _limits_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "off")
+
+
+class TestTryStartRun:
+    async def test_claims_enqueue_run_without_older_active_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _session(_result(first=_run_row()), _result(first=_run_row()), _result(rowcount=1))
+        monkeypatch.setattr(run_admission, "lock_thread", AsyncMock())
+        monkeypatch.setattr(run_admission, "_has_older_active_run", AsyncMock(return_value=False))
+
+        outcome = await try_start_run(session, RUN_ID, claimed_by="worker-1")
+
+        assert outcome is AdmissionOutcome.CLAIMED
+        claim = session.execute.await_args_list[-1].args[0]
+        assert claim.compile().params["claimed_by"] == "worker-1"
+        assert claim.compile().params["pending_reason"] is None
+        assert claim.compile().params["pending_reason_at"] is None
+
+    async def test_leaves_enqueue_run_pending_behind_older_active_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _session(_result(first=_run_row()), _result(first=_run_row()), _result(rowcount=1))
+        monkeypatch.setattr(run_admission, "lock_thread", AsyncMock())
+        monkeypatch.setattr(run_admission, "_has_older_active_run", AsyncMock(return_value=True))
+
+        outcome = await try_start_run(session, RUN_ID)
+
+        assert outcome is AdmissionOutcome.THREAD_BLOCKED
+        blocked = session.execute.await_args_list[-1].args[0].compile().params
+        assert blocked["pending_reason"] == "thread"
+        assert isinstance(blocked["pending_reason_at"], datetime)
+
+    async def test_same_block_reason_preserves_original_timestamp(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        row = _run_row(pending_reason="thread")
+        session = _session(_result(first=row), _result(first=row), _result(rowcount=1))
+        monkeypatch.setattr(run_admission, "lock_thread", AsyncMock())
+        monkeypatch.setattr(run_admission, "_has_older_active_run", AsyncMock(return_value=True))
+
+        outcome = await try_start_run(session, RUN_ID)
+
+        assert outcome is AdmissionOutcome.THREAD_BLOCKED
+        blocked = session.execute.await_args_list[-1].args[0].compile().params
+        assert "pending_reason_at" not in blocked
+
+    async def test_non_enqueue_strategy_does_not_check_predecessors(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        row = _run_row(strategy="rollback")
+        session = _session(_result(first=row), _result(first=row), _result(rowcount=1))
+        older = AsyncMock(return_value=True)
+        monkeypatch.setattr(run_admission, "lock_thread", AsyncMock())
+        monkeypatch.setattr(run_admission, "_has_older_active_run", older)
+
+        outcome = await try_start_run(session, RUN_ID)
+
+        assert outcome is AdmissionOutcome.CLAIMED
+        older.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("row", "expected"),
+        [
+            (None, AdmissionOutcome.ALREADY_TAKEN),
+            (_run_row(status="running"), AdmissionOutcome.ALREADY_TAKEN),
+            (_run_row(claimed_by="worker-1"), AdmissionOutcome.ALREADY_TAKEN),
+        ],
+    )
+    async def test_rejects_missing_or_taken_run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        row: object,
+        expected: AdmissionOutcome,
+    ) -> None:
+        session = _session(_result(first=row))
+        lock = AsyncMock()
+        monkeypatch.setattr(run_admission, "lock_thread", lock)
+
+        assert await try_start_run(session, RUN_ID) is expected
+        lock.assert_not_awaited()
+
+    async def test_org_capacity_is_checked_after_thread_eligibility(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
+        row = _run_row(org_id=ORG, pending_reason="thread")
+        session = _session(_result(first=row), _result(first=row), _result(rowcount=1))
+        order: list[str] = []
+        monkeypatch.setattr(
+            run_admission,
+            "lock_thread",
+            AsyncMock(side_effect=lambda *_: order.append("thread")),
+        )
+        monkeypatch.setattr(run_admission, "_has_older_active_run", AsyncMock(return_value=False))
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "lock_org",
+            AsyncMock(side_effect=lambda *_: order.append("org")),
+        )
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "evaluate",
+            AsyncMock(return_value=LimitDecision(org_id=ORG, active=1, limit=1)),
+        )
+
+        outcome = await try_start_run(session, RUN_ID)
+
+        assert outcome is AdmissionOutcome.ORG_AT_CAPACITY
+        assert order == ["thread", "org"]
+        blocked = session.execute.await_args_list[-1].args[0].compile().params
+        assert blocked["pending_reason"] == "org"
+        assert isinstance(blocked["pending_reason_at"], datetime)
+
+    async def test_shadow_org_limit_records_metric_but_claims(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "shadow")
+        row = _run_row(org_id=ORG)
+        session = _session(_result(first=row), _result(first=row), _result(rowcount=1))
+        monkeypatch.setattr(run_admission, "lock_thread", AsyncMock())
+        monkeypatch.setattr(run_admission, "_has_older_active_run", AsyncMock(return_value=False))
+        monkeypatch.setattr(run_admission.run_limits, "lock_org", AsyncMock())
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "evaluate",
+            AsyncMock(return_value=LimitDecision(org_id=ORG, active=1, limit=1)),
+        )
+        metric = MagicMock()
+        monkeypatch.setattr(run_admission, "emit_metric", metric)
+
+        outcome = await try_start_run(session, RUN_ID)
+
+        assert outcome is AdmissionOutcome.CLAIMED
+        metric.assert_called_once()
+
+    async def test_org_with_free_capacity_claims_after_both_locks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
+        row = _run_row(org_id=ORG)
+        session = _session(_result(first=row), _result(first=row), _result(rowcount=1))
+        order: list[str] = []
+        monkeypatch.setattr(
+            run_admission,
+            "lock_thread",
+            AsyncMock(side_effect=lambda *_: order.append("thread")),
+        )
+        monkeypatch.setattr(run_admission, "_has_older_active_run", AsyncMock(return_value=False))
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "lock_org",
+            AsyncMock(side_effect=lambda *_: order.append("org")),
+        )
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "evaluate",
+            AsyncMock(return_value=LimitDecision(org_id=ORG, active=0, limit=1)),
+        )
+
+        outcome = await try_start_run(session, RUN_ID)
+
+        assert outcome is AdmissionOutcome.CLAIMED
+        assert order == ["thread", "org"]
+
+    async def test_conditional_claim_race_returns_already_taken(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = _session(_result(first=_run_row()), _result(first=_run_row()), _result(rowcount=0))
+        monkeypatch.setattr(run_admission, "lock_thread", AsyncMock())
+        monkeypatch.setattr(run_admission, "_has_older_active_run", AsyncMock(return_value=False))
+
+        assert await try_start_run(session, RUN_ID) is AdmissionOutcome.ALREADY_TAKEN
+
+
+class TestThreadLock:
+    async def test_uses_transaction_scoped_thread_namespace(self) -> None:
+        session = AsyncMock()
+
+        await run_admission.lock_thread(session, THREAD_ID)
+
+        statement = str(session.execute.await_args.args[0])
+        params = session.execute.await_args.args[1]
+        assert "pg_advisory_xact_lock" in statement
+        assert params == {
+            "namespace": run_admission.THREAD_ADVISORY_LOCK_NAMESPACE,
+            "thread_id": THREAD_ID,
+        }
+
+
+class TestPredecessorQuery:
+    async def test_only_pending_and_running_older_rows_block(self) -> None:
+        session = AsyncMock()
+        session.scalar = AsyncMock(return_value=False)
+        state = run_admission._AdmissionState(
+            thread_id=THREAD_ID,
+            org_id=None,
+            status="pending",
+            claimed_by=None,
+            multitask_strategy="enqueue",
+            queue_position=2,
+            pending_reason=None,
+        )
+
+        assert not await run_admission._has_older_active_run(session, state)
+
+        statement = str(session.scalar.await_args.args[0])
+        assert "runs.queue_position <" in statement
+        assert "runs.status IN" in statement

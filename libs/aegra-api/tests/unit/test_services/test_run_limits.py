@@ -6,13 +6,11 @@ import pytest
 
 from aegra_api.services import run_limits
 from aegra_api.services.run_limits import (
-    ClaimOutcome,
     LimitDecision,
     find_promotable_runs,
     limit_for,
     max_limit,
     resolve_org_id,
-    try_start_run,
 )
 from aegra_api.settings import settings
 
@@ -104,58 +102,6 @@ class TestLimitDecision:
 
     def test_not_at_capacity_below_limit(self) -> None:
         assert not LimitDecision(org_id=ORG, active=1, limit=2).at_capacity
-
-
-class TestTryStartRun:
-    async def test_claims_with_a_single_update_when_limits_are_off(self) -> None:
-        """The default path must not pay for a capacity lookup."""
-        session = _session(execute=[_result(rowcount=1)])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.CLAIMED
-        assert session.execute.await_count == 1
-
-    async def test_returns_already_taken_when_update_matches_nothing(self) -> None:
-        session = _session(execute=[_result(rowcount=0)])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.ALREADY_TAKEN
-
-    async def test_claims_when_org_has_free_capacity(self, limits: None) -> None:
-        session = _session(
-            execute=[_result(first=(ORG, "pending", None)), _result(), _result(rowcount=1)],
-            scalar=1,
-        )
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.CLAIMED
-
-    async def test_returns_at_capacity_when_org_is_full(self, limits: None) -> None:
-        session = _session(execute=[_result(first=(ORG, "pending", None)), _result()], scalar=2)
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.AT_CAPACITY
-
-    async def test_full_org_still_claims_in_shadow_mode(self, monkeypatch: pytest.MonkeyPatch, limits: None) -> None:
-        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "shadow")
-        session = _session(
-            execute=[_result(first=(ORG, "pending", None)), _result(), _result(rowcount=1)],
-            scalar=99,
-        )
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.CLAIMED
-
-    async def test_run_without_org_is_exempt(self, limits: None) -> None:
-        """A run with no tenant is never gated, and never takes an org lock."""
-        session = _session(execute=[_result(first=(None, "pending", None)), _result(rowcount=1)])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.CLAIMED
-
-    async def test_returns_already_taken_when_run_is_gone(self, limits: None) -> None:
-        session = _session(execute=[_result(first=None)])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.ALREADY_TAKEN
-
-    async def test_returns_already_taken_when_run_is_no_longer_pending(self, limits: None) -> None:
-        session = _session(execute=[_result(first=(ORG, "running", "worker-1"))])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.ALREADY_TAKEN
 
 
 class TestFindPromotableRuns:

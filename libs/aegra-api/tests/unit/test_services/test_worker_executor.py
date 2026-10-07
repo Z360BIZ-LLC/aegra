@@ -140,17 +140,17 @@ class TestAcquireAndLoad:
     async def test_returns_loaded_run_when_lease_acquired(self) -> None:
         run_orm = _make_run_orm()
         session = AsyncMock()
-
-        # First execute: UPDATE (lease acquisition)
-        update_result = MagicMock()
-        update_result.rowcount = 1
-        # Second call: scalar (SELECT run)
-        session.execute = AsyncMock(return_value=update_result)
         session.scalar = AsyncMock(return_value=run_orm)
         session.commit = AsyncMock()
         maker = _make_session_maker(session)
 
-        with patch(f"{MODULE}._get_session_maker", return_value=maker):
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=maker),
+            patch(
+                f"{MODULE}.run_limits.try_start_run",
+                AsyncMock(return_value=run_limits.ClaimOutcome.CLAIMED),
+            ),
+        ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
 
         assert result is not None
@@ -162,13 +162,16 @@ class TestAcquireAndLoad:
     @pytest.mark.asyncio
     async def test_returns_none_when_lease_already_taken(self) -> None:
         session = AsyncMock()
-        update_result = MagicMock()
-        update_result.rowcount = 0
-        session.execute = AsyncMock(return_value=update_result)
         session.rollback = AsyncMock()
         maker = _make_session_maker(session)
 
-        with patch(f"{MODULE}._get_session_maker", return_value=maker):
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=maker),
+            patch(
+                f"{MODULE}.run_limits.try_start_run",
+                AsyncMock(return_value=run_limits.ClaimOutcome.ALREADY_TAKEN),
+            ),
+        ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
 
         assert result is None
@@ -180,14 +183,17 @@ class TestAcquireAndLoad:
         run_orm.execution_params = None
 
         session = AsyncMock()
-        update_result = MagicMock()
-        update_result.rowcount = 1
-        session.execute = AsyncMock(return_value=update_result)
         session.scalar = AsyncMock(return_value=run_orm)
         session.commit = AsyncMock()
         maker = _make_session_maker(session)
 
-        with patch(f"{MODULE}._get_session_maker", return_value=maker):
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=maker),
+            patch(
+                f"{MODULE}.run_limits.try_start_run",
+                AsyncMock(return_value=run_limits.ClaimOutcome.CLAIMED),
+            ),
+        ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
 
         assert result is None

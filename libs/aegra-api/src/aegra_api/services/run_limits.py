@@ -24,16 +24,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import structlog
-from observability.cloudwatch_emf import emit_metric
 from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.settings import settings
-
-logger = structlog.getLogger(__name__)
 
 # Two-argument advisory locks occupy a namespace of their own, so this can
 # never collide with the single-argument lock state_backfill takes.
@@ -179,86 +175,31 @@ async def try_start_run(
     claimed_by: str | None = None,
     lease_expires_at: datetime | None = None,
 ) -> ClaimOutcome:
-    """Atomically move a run from ``pending`` to ``running`` if capacity allows.
-
-    Does NOT commit — the caller owns the transaction boundary, and the org
-    advisory lock must stay held until it closes.
-
-    ``AT_CAPACITY`` means the run is still valid and still queued; the caller
-    should leave it ``pending`` for the promoter rather than re-enqueueing it.
-
-    With limits off this is exactly the single atomic UPDATE it has always
-    been — the gate adds no round-trip to the default path.
-    """
-    if settings.run_limits.enabled:
-        gated = await _apply_capacity_gate(session, run_id)
-        if gated is not None:
-            return gated
-
-    result = await session.execute(
-        update(RunORM)
-        .where(RunORM.run_id == run_id, RunORM.status == "pending", RunORM.claimed_by.is_(None))
-        .values(claimed_by=claimed_by, lease_expires_at=lease_expires_at, status="running")
+    """Compatibility adapter until executors import run_admission directly."""
+    # Deferred to avoid the run_admission -> run_limits import cycle.
+    from aegra_api.services.run_admission import (
+        AdmissionOutcome,
     )
-    if result.rowcount == 0:  # type: ignore[union-attr]
-        return ClaimOutcome.ALREADY_TAKEN
-    return ClaimOutcome.CLAIMED
-
-
-async def _apply_capacity_gate(session: AsyncSession, run_id: str) -> ClaimOutcome | None:
-    """Return a terminal outcome when the claim must not proceed.
-
-    None means "carry on and attempt the claim". In shadow mode a full org
-    still proceeds, but emits the metric that would have gated it.
-    """
-    row = (
-        await session.execute(select(RunORM.org_id, RunORM.status, RunORM.claimed_by).where(RunORM.run_id == run_id))
-    ).first()
-    if row is None:
-        return ClaimOutcome.ALREADY_TAKEN
-
-    org_id, status, existing_claim = row
-    if status != "pending" or existing_claim is not None:
-        return ClaimOutcome.ALREADY_TAKEN
-    if org_id is None:
-        return None
-
-    await lock_org(session, org_id)
-    decision = await evaluate(session, org_id)
-    if not decision.at_capacity:
-        return None
-
-    if not settings.run_limits.enforcing:
-        emit_metric(
-            "OrgRunWouldQueue",
-            1,
-            properties={
-                "run_id": run_id,
-                "org_id": org_id,
-                "active": decision.active,
-                "limit": decision.limit,
-            },
-        )
-        return None
-
-    logger.info(
-        "Run held at org concurrency limit",
-        run_id=run_id,
-        org_id=org_id,
-        active=decision.active,
-        limit=decision.limit,
+    from aegra_api.services.run_admission import (
+        try_start_run as admit,
     )
-    emit_metric(
-        "OrgRunQueued",
-        1,
-        properties={
-            "run_id": run_id,
-            "org_id": org_id,
-            "active": decision.active,
-            "limit": decision.limit,
-        },
+
+    outcome = await admit(
+        session,
+        run_id,
+        claimed_by=claimed_by,
+        lease_expires_at=lease_expires_at,
     )
-    return ClaimOutcome.AT_CAPACITY
+    if outcome is AdmissionOutcome.CLAIMED:
+        return ClaimOutcome.CLAIMED
+    if outcome in (
+        AdmissionOutcome.THREAD_BLOCKED,
+        AdmissionOutcome.ORG_AT_CAPACITY,
+    ):
+        return ClaimOutcome.AT_CAPACITY
+    if outcome is AdmissionOutcome.ALREADY_TAKEN:
+        return ClaimOutcome.ALREADY_TAKEN
+    raise AssertionError(f"Unhandled admission outcome: {outcome}")
 
 
 async def active_counts_by_org(session: AsyncSession) -> dict[str, int]:
