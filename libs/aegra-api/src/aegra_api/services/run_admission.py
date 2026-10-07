@@ -19,31 +19,28 @@ THREAD_ADVISORY_LOCK_NAMESPACE = 8472
 
 _PROMOTABLE_CANDIDATES_SQL = text(
     """
-    WITH eligible AS (
+    WITH scanned AS (
         SELECT candidate.run_id,
                candidate.org_id,
+               candidate.thread_id,
                candidate.queue_position,
-               row_number() OVER (
-                   PARTITION BY candidate.org_id
-                   ORDER BY candidate.queue_position
-               ) AS org_rank
+               candidate.multitask_strategy
           FROM runs AS candidate
          WHERE candidate.status = 'pending'
            AND candidate.claimed_by IS NULL
+           AND candidate.queue_position > :after_queue_position
            AND (
                candidate.pending_reason IS NOT NULL
                OR candidate.updated_at > candidate.created_at
                OR candidate.created_at < :stuck_before
            )
-           AND (
-               candidate.org_id IS NULL
-               OR NOT (
-                   candidate.org_id = ANY(
-                       CAST(:saturated_org_ids AS TEXT[])
-                   )
-               )
-           )
-           AND (
+         ORDER BY candidate.queue_position
+         LIMIT :scan_limit
+    )
+    SELECT candidate.run_id,
+           candidate.org_id,
+           candidate.queue_position,
+           (
                candidate.multitask_strategy <> 'enqueue'
                OR NOT EXISTS (
                    SELECT 1
@@ -52,14 +49,14 @@ _PROMOTABLE_CANDIDATES_SQL = text(
                       AND predecessor.queue_position < candidate.queue_position
                       AND predecessor.status IN ('pending', 'running')
                )
-           )
-    )
-    SELECT run_id, org_id
-      FROM eligible
-     ORDER BY org_rank, queue_position
-     LIMIT :scan_limit
+           ) AS thread_eligible
+      FROM scanned AS candidate
+     ORDER BY candidate.queue_position
     """
 )
+
+_PROMOTION_SCAN_MULTIPLIER = 10
+_promotion_cursor = 0
 
 
 class AdmissionOutcome(enum.Enum):
@@ -181,36 +178,43 @@ async def find_promotable_runs(
     *,
     batch_size: int,
 ) -> list[str]:
-    """Find durable queue heads, with projected org capacity and fairness."""
+    """Find durable queue heads using one bounded, rotating queue page."""
+    global _promotion_cursor
+
     if batch_size <= 0:
         return []
 
     active = await run_limits.active_counts_by_org(session) if settings.run_limits.enforcing else {}
-    scan_multiplier = max(10, run_limits.max_limit())
-    saturated_org_ids = (
-        sorted(org_id for org_id, count in active.items() if count >= run_limits.limit_for(org_id))
-        if settings.run_limits.enforcing
-        else []
-    )
     candidates = await session.execute(
         _PROMOTABLE_CANDIDATES_SQL,
         {
             "stuck_before": datetime.now(UTC) - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS),
-            "saturated_org_ids": saturated_org_ids,
-            "scan_limit": batch_size * scan_multiplier,
+            "after_queue_position": _promotion_cursor,
+            "scan_limit": batch_size * _PROMOTION_SCAN_MULTIPLIER,
         },
     )
+    rows = candidates.all()
+    if not rows:
+        # Wrap on the next tick. Keeping each invocation to one query means a
+        # huge or entirely blocked backlog cannot amplify work per replica.
+        _promotion_cursor = 0
+        return []
 
     promotable: list[str] = []
     projected = dict(active)
-    for run_id, org_id in candidates.all():
+    next_cursor = _promotion_cursor
+    for run_id, org_id, queue_position, thread_eligible in rows:
         if len(promotable) >= batch_size:
             break
+        next_cursor = queue_position
+        if not thread_eligible:
+            continue
         if settings.run_limits.enforcing and org_id is not None:
             if projected.get(org_id, 0) >= run_limits.limit_for(org_id):
                 continue
             projected[org_id] = projected.get(org_id, 0) + 1
         promotable.append(run_id)
+    _promotion_cursor = next_cursor
     return promotable
 
 

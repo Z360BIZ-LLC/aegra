@@ -56,6 +56,7 @@ def _run_row(
 @pytest.fixture(autouse=True)
 def _limits_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "off")
+    monkeypatch.setattr(run_admission, "_promotion_cursor", 0)
 
 
 class TestTryStartRun:
@@ -257,7 +258,7 @@ class TestFindPromotableRuns:
     ) -> None:
         monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
         monkeypatch.setattr(settings.run_limits, "ORG_MAX_CONCURRENT_RUNS", 1)
-        session = _session(_result(rows=[("eligible", "org-2")]))
+        session = _session(_result(rows=[("eligible", "org-2", 11, True)]))
         monkeypatch.setattr(
             run_admission.run_limits,
             "active_counts_by_org",
@@ -269,15 +270,44 @@ class TestFindPromotableRuns:
         assert result == ["eligible"]
         session.execute.assert_awaited_once()
         params = session.execute.await_args.args[1]
-        assert params["saturated_org_ids"] == [ORG]
         assert params["scan_limit"] == 10
-        assert "saturated_org_ids" in str(session.execute.await_args.args[0])
+        assert params["after_queue_position"] == 0
+        assert "row_number" not in str(session.execute.await_args.args[0])
+        assert run_admission._promotion_cursor == 11
+
+    async def test_rotating_cursor_skips_bounded_blocked_pages(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
+        monkeypatch.setattr(settings.run_limits, "ORG_MAX_CONCURRENT_RUNS", 1)
+        session = _session(
+            _result(rows=[("full", ORG, 10, True)]),
+            _result(rows=[("eligible", "org-2", 20, True)]),
+        )
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "active_counts_by_org",
+            AsyncMock(return_value={ORG: 1}),
+        )
+
+        assert await run_admission.find_promotable_runs(session, batch_size=1) == []
+        assert await run_admission.find_promotable_runs(session, batch_size=1) == ["eligible"]
+        assert [call.args[1]["after_queue_position"] for call in session.execute.await_args_list] == [0, 10]
 
     async def test_selects_enqueue_thread_heads_and_non_enqueue_runs(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        session = _session(_result(rows=[("head-a", ORG), ("head-b", "org-2"), ("rollback", None)]))
+        session = _session(
+            _result(
+                rows=[
+                    ("head-a", ORG, 1, True),
+                    ("head-b", "org-2", 2, True),
+                    ("rollback", None, 3, True),
+                ]
+            )
+        )
         monkeypatch.setattr(
             run_admission.run_limits,
             "active_counts_by_org",
@@ -302,9 +332,9 @@ class TestFindPromotableRuns:
         session = _session(
             _result(
                 rows=[
-                    ("org-1-first", ORG),
-                    ("org-2-first", "org-2"),
-                    ("org-1-second", ORG),
+                    ("org-1-first", ORG, 1, True),
+                    ("org-2-first", "org-2", 2, True),
+                    ("org-1-second", ORG, 3, True),
                 ]
             )
         )
@@ -322,7 +352,9 @@ class TestFindPromotableRuns:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        session = _session(_result(rows=[("stale-unscoped", None), ("other-thread", None)]))
+        session = _session(
+            _result(rows=[("stale-unscoped", None, 1, True), ("other-thread", None, 2, True)])
+        )
         monkeypatch.setattr(
             run_admission.run_limits,
             "active_counts_by_org",
