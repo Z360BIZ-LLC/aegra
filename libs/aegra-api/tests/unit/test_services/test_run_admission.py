@@ -28,9 +28,10 @@ def _result(
     return result
 
 
-def _session(*results: MagicMock) -> AsyncMock:
+def _session(*results: MagicMock, high_water: int | None = 100) -> AsyncMock:
     session = AsyncMock()
     session.execute = AsyncMock(side_effect=results)
+    session.scalar = AsyncMock(return_value=high_water)
     return session
 
 
@@ -57,6 +58,7 @@ def _run_row(
 def _limits_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "off")
     monkeypatch.setattr(run_admission, "_promotion_cursor", 0)
+    monkeypatch.setattr(run_admission, "_promotion_high_water", None)
 
 
 class TestTryStartRun:
@@ -272,7 +274,11 @@ class TestFindPromotableRuns:
         params = session.execute.await_args.args[1]
         assert params["scan_limit"] == 10
         assert params["after_queue_position"] == 0
-        assert "row_number" not in str(session.execute.await_args.args[0])
+        assert params["high_water_position"] == 100
+        statement = str(session.execute.await_args.args[0])
+        assert "row_number" not in statement
+        bounded_page = statement.split("ORDER BY candidate.queue_position", 1)[0]
+        assert "pending_reason IS NOT NULL" not in bounded_page
         assert run_admission._promotion_cursor == 11
 
     async def test_rotating_cursor_skips_bounded_blocked_pages(
@@ -284,6 +290,7 @@ class TestFindPromotableRuns:
         session = _session(
             _result(rows=[("full", ORG, 10, True)]),
             _result(rows=[("eligible", "org-2", 20, True)]),
+            high_water=20,
         )
         monkeypatch.setattr(
             run_admission.run_limits,
@@ -294,6 +301,34 @@ class TestFindPromotableRuns:
         assert await run_admission.find_promotable_runs(session, batch_size=1) == []
         assert await run_admission.find_promotable_runs(session, batch_size=1) == ["eligible"]
         assert [call.args[1]["after_queue_position"] for call in session.execute.await_args_list] == [0, 10]
+        assert run_admission._promotion_cursor == 0
+        assert run_admission._promotion_high_water is None
+
+    async def test_high_water_wrap_revisits_skipped_rows_while_tail_grows(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session = _session(
+            _result(rows=[("blocked", ORG, 10, False)]),
+            _result(rows=[("cycle-end", ORG, 20, False)]),
+            _result(rows=[("now-eligible", ORG, 10, True)]),
+            high_water=20,
+        )
+        # A new cycle captures a newer tail only after reaching the old bound.
+        session.scalar = AsyncMock(side_effect=[20, 30])
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "active_counts_by_org",
+            AsyncMock(return_value={}),
+        )
+
+        assert await run_admission.find_promotable_runs(session, batch_size=1) == []
+        assert await run_admission.find_promotable_runs(session, batch_size=1) == []
+        assert await run_admission.find_promotable_runs(session, batch_size=1) == ["now-eligible"]
+
+        params = [call.args[1] for call in session.execute.await_args_list]
+        assert [item["after_queue_position"] for item in params] == [0, 10, 0]
+        assert [item["high_water_position"] for item in params] == [20, 20, 30]
 
     async def test_selects_enqueue_thread_heads_and_non_enqueue_runs(
         self,

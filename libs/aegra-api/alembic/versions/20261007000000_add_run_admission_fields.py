@@ -106,9 +106,17 @@ def upgrade() -> None:
         unique=False,
         postgresql_where=sa.text("status IN ('pending', 'running')"),
     )
+    op.create_index(
+        "idx_runs_pending_queue_position",
+        "runs",
+        ["queue_position"],
+        unique=False,
+        postgresql_where=sa.text("status = 'pending' AND claimed_by IS NULL"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("idx_runs_pending_queue_position", table_name="runs")
     op.drop_index("idx_runs_thread_active_queue", table_name="runs")
     op.drop_constraint("ck_runs_pending_reason", "runs", type_="check")
     op.drop_constraint("ck_runs_multitask_strategy", "runs", type_="check")

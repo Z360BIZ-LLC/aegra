@@ -241,6 +241,11 @@ class Run(Base):
             "queue_position",
             postgresql_where=text("status IN ('pending', 'running')"),
         ),
+        Index(
+            "idx_runs_pending_queue_position",
+            "queue_position",
+            postgresql_where=text("status = 'pending' AND claimed_by IS NULL"),
+        ),
         CheckConstraint(
             "multitask_strategy IN ('reject', 'interrupt', 'rollback', 'enqueue')",
             name="ck_runs_multitask_strategy",

@@ -58,6 +58,8 @@ class TestRunAdmissionMigration:
         assert "ck_runs_multitask_strategy" in sql
         assert "ck_runs_pending_reason" in sql
         assert "idx_runs_thread_active_queue" in sql
+        assert "idx_runs_pending_queue_position" in sql
+        assert "WHERE status = 'pending' AND claimed_by IS NULL" in sql
         assert "WHERE status IN ('pending', 'running')" in sql
         assert sql.index("row_number()") < sql.index("ALTER COLUMN queue_position SET NOT NULL")
 
@@ -65,6 +67,7 @@ class TestRunAdmissionMigration:
         sql = _render_migration("downgrade")
 
         assert "DROP INDEX idx_runs_thread_active_queue" in sql
+        assert "DROP INDEX idx_runs_pending_queue_position" in sql
         assert "DROP CONSTRAINT ck_runs_pending_reason" in sql
         assert "DROP CONSTRAINT ck_runs_multitask_strategy" in sql
         assert "DROP COLUMN pending_reason_at" in sql
@@ -83,6 +86,11 @@ class TestRunAdmissionMigration:
         index = next(index for index in runs.indexes if index.name == "idx_runs_thread_active_queue")
         assert [column.name for column in index.columns] == ["thread_id", "queue_position"]
         assert str(index.dialect_options["postgresql"]["where"]) == "status IN ('pending', 'running')"
+        pending_index = next(index for index in runs.indexes if index.name == "idx_runs_pending_queue_position")
+        assert [column.name for column in pending_index.columns] == ["queue_position"]
+        assert str(pending_index.dialect_options["postgresql"]["where"]) == (
+            "status = 'pending' AND claimed_by IS NULL"
+        )
 
 
 class TestFindAlembicIni:

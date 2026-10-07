@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from observability.cloudwatch_emf import emit_metric
-from sqlalchemy import exists, select, text, update
+from sqlalchemy import exists, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.orm import Run as RunORM
@@ -24,16 +24,15 @@ _PROMOTABLE_CANDIDATES_SQL = text(
                candidate.org_id,
                candidate.thread_id,
                candidate.queue_position,
-               candidate.multitask_strategy
+               candidate.multitask_strategy,
+               candidate.pending_reason,
+               candidate.created_at,
+               candidate.updated_at
           FROM runs AS candidate
          WHERE candidate.status = 'pending'
            AND candidate.claimed_by IS NULL
            AND candidate.queue_position > :after_queue_position
-           AND (
-               candidate.pending_reason IS NOT NULL
-               OR candidate.updated_at > candidate.created_at
-               OR candidate.created_at < :stuck_before
-           )
+           AND candidate.queue_position <= :high_water_position
          ORDER BY candidate.queue_position
          LIMIT :scan_limit
     )
@@ -41,15 +40,22 @@ _PROMOTABLE_CANDIDATES_SQL = text(
            candidate.org_id,
            candidate.queue_position,
            (
-               candidate.multitask_strategy <> 'enqueue'
-               OR NOT EXISTS (
-                   SELECT 1
-                     FROM runs AS predecessor
-                    WHERE predecessor.thread_id = candidate.thread_id
-                      AND predecessor.queue_position < candidate.queue_position
-                      AND predecessor.status IN ('pending', 'running')
+               (
+                   candidate.pending_reason IS NOT NULL
+                   OR candidate.updated_at > candidate.created_at
+                   OR candidate.created_at < :stuck_before
                )
-           ) AS thread_eligible
+               AND (
+                   candidate.multitask_strategy <> 'enqueue'
+                   OR NOT EXISTS (
+                       SELECT 1
+                         FROM runs AS predecessor
+                        WHERE predecessor.thread_id = candidate.thread_id
+                          AND predecessor.queue_position < candidate.queue_position
+                          AND predecessor.status IN ('pending', 'running')
+                   )
+               )
+           ) AS retry_eligible
       FROM scanned AS candidate
      ORDER BY candidate.queue_position
     """
@@ -57,6 +63,7 @@ _PROMOTABLE_CANDIDATES_SQL = text(
 
 _PROMOTION_SCAN_MULTIPLIER = 10
 _promotion_cursor = 0
+_promotion_high_water: int | None = None
 
 
 class AdmissionOutcome(enum.Enum):
@@ -179,10 +186,21 @@ async def find_promotable_runs(
     batch_size: int,
 ) -> list[str]:
     """Find durable queue heads using one bounded, rotating queue page."""
-    global _promotion_cursor
+    global _promotion_cursor, _promotion_high_water
 
     if batch_size <= 0:
         return []
+
+    if _promotion_high_water is None:
+        _promotion_high_water = await session.scalar(
+            select(func.max(RunORM.queue_position)).where(
+                RunORM.status == "pending",
+                RunORM.claimed_by.is_(None),
+            )
+        )
+        if _promotion_high_water is None:
+            _promotion_cursor = 0
+            return []
 
     active = await run_limits.active_counts_by_org(session) if settings.run_limits.enforcing else {}
     candidates = await session.execute(
@@ -190,6 +208,7 @@ async def find_promotable_runs(
         {
             "stuck_before": datetime.now(UTC) - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS),
             "after_queue_position": _promotion_cursor,
+            "high_water_position": _promotion_high_water,
             "scan_limit": batch_size * _PROMOTION_SCAN_MULTIPLIER,
         },
     )
@@ -198,16 +217,17 @@ async def find_promotable_runs(
         # Wrap on the next tick. Keeping each invocation to one query means a
         # huge or entirely blocked backlog cannot amplify work per replica.
         _promotion_cursor = 0
+        _promotion_high_water = None
         return []
 
     promotable: list[str] = []
     projected = dict(active)
     next_cursor = _promotion_cursor
-    for run_id, org_id, queue_position, thread_eligible in rows:
+    for run_id, org_id, queue_position, retry_eligible in rows:
         if len(promotable) >= batch_size:
             break
         next_cursor = queue_position
-        if not thread_eligible:
+        if not retry_eligible:
             continue
         if settings.run_limits.enforcing and org_id is not None:
             if projected.get(org_id, 0) >= run_limits.limit_for(org_id):
@@ -215,6 +235,9 @@ async def find_promotable_runs(
             projected[org_id] = projected.get(org_id, 0) + 1
         promotable.append(run_id)
     _promotion_cursor = next_cursor
+    if _promotion_cursor >= _promotion_high_water:
+        _promotion_cursor = 0
+        _promotion_high_water = None
     return promotable
 
 
