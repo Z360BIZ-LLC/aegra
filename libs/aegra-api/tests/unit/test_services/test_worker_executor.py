@@ -972,6 +972,42 @@ class TestDequeue:
         mock_warning.assert_called_once()
 
 
+class TestPostgresFallback:
+    @pytest.mark.asyncio
+    async def test_uses_shared_promotable_selector(self) -> None:
+        session = AsyncMock()
+        selector = AsyncMock(return_value=["eligible-run"])
+
+        with (
+            patch(
+                f"{MODULE}._get_session_maker",
+                return_value=_make_session_maker(session),
+            ),
+            patch(f"{MODULE}.find_promotable_runs", selector),
+        ):
+            result = await WorkerExecutor._poll_postgres()
+
+        assert result == "eligible-run"
+        selector.assert_awaited_once_with(session, batch_size=1)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_without_eligible_candidate(self) -> None:
+        session = AsyncMock()
+
+        with (
+            patch(
+                f"{MODULE}._get_session_maker",
+                return_value=_make_session_maker(session),
+            ),
+            patch(
+                f"{MODULE}.find_promotable_runs",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            assert await WorkerExecutor._poll_postgres() is None
+
+
 # ------------------------------------------------------------------
 # Drain requeue (#474)
 # ------------------------------------------------------------------

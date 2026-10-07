@@ -173,86 +173,6 @@ async def active_counts_by_org(session: AsyncSession) -> dict[str, int]:
     return {org_id: count for org_id, count in result.all() if org_id is not None}
 
 
-# Ordering by rank-then-age hands every org its oldest queued run before any
-# org gets a second, so a large backlog cannot crowd the scan window.
-_PROMOTABLE_CANDIDATES_SQL = text(
-    """
-    SELECT run_id, org_id
-      FROM (
-           SELECT run_id,
-                  org_id,
-                  created_at,
-                  row_number() OVER (PARTITION BY org_id ORDER BY created_at) AS rank
-             FROM runs
-            WHERE status = 'pending'
-              AND claimed_by IS NULL
-              AND org_id IS NOT NULL
-           ) ranked
-     WHERE rank <= :max_per_org
-     ORDER BY rank, created_at
-     LIMIT :scan_limit
-    """
-)
-
-
-# Runs with no tenant are exempt from limits, so they never appear above — but
-# the promoter replaces the reaper's stuck-pending sweep while enforcing, and
-# without this they would have no recovery path at all if their queue entry is
-# lost (Redis restart, or a crash between the run's commit and its enqueue).
-# Age-gated so freshly enqueued runs aren't pushed twice.
-_STUCK_UNSCOPED_CANDIDATES_SQL = text(
-    """
-    SELECT run_id
-      FROM runs
-     WHERE status = 'pending'
-       AND claimed_by IS NULL
-       AND org_id IS NULL
-       AND created_at < :stuck_before
-     ORDER BY created_at
-     LIMIT :scan_limit
-    """
-)
-
-
-async def find_promotable_runs(session: AsyncSession, *, batch_size: int) -> list[str]:
-    """Return queued run_ids that are safe to dispatch, fairest-first.
-
-    Purely advisory: the promoter re-enqueues these, and the claim re-checks
-    capacity under the org lock, so an over-selection here is harmless.
-    """
-    active = await active_counts_by_org(session)
-    candidates = await session.execute(
-        _PROMOTABLE_CANDIDATES_SQL,
-        {"max_per_org": max_limit(), "scan_limit": batch_size * 10},
-    )
-
-    promotable: list[str] = []
-    projected = dict(active)
-    for run_id, org_id in candidates.all():
-        if len(promotable) >= batch_size:
-            break
-        if projected.get(org_id, 0) >= limit_for(org_id):
-            continue
-        projected[org_id] = projected.get(org_id, 0) + 1
-        promotable.append(run_id)
-
-    remaining = batch_size - len(promotable)
-    if remaining > 0:
-        promotable.extend(await _find_stuck_unscoped_runs(session, batch_size=remaining))
-
-    return promotable
-
-
-async def _find_stuck_unscoped_runs(session: AsyncSession, *, batch_size: int) -> list[str]:
-    """Return long-pending runs that carry no tenant and so are never gated."""
-    stuck_before = datetime.now(UTC) - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS)
-    result = await session.execute(
-        _STUCK_UNSCOPED_CANDIDATES_SQL,
-        {"stuck_before": stuck_before, "scan_limit": batch_size},
-    )
-    return [row[0] for row in result.all()]
-
-
 @dataclass(frozen=True, slots=True)
 class ExpiredRun:
     """A queued run that waited too long, detached from its session.
@@ -284,10 +204,10 @@ async def find_expired_queued_runs(session: AsyncSession, *, batch_size: int) ->
         .where(
             RunORM.status == "pending",
             RunORM.claimed_by.is_(None),
-            RunORM.org_id.isnot(None),
-            RunORM.created_at < cutoff,
+            RunORM.pending_reason == "org",
+            RunORM.pending_reason_at < cutoff,
         )
-        .order_by(RunORM.created_at.asc())
+        .order_by(RunORM.pending_reason_at.asc())
         .limit(batch_size)
     )
     result = await session.execute(stmt)
@@ -325,6 +245,7 @@ async def claim_expired_run(session: AsyncSession, run_id: str, *, error: str) -
             RunORM.run_id == run_id,
             RunORM.status == "pending",
             RunORM.claimed_by.is_(None),
+            RunORM.pending_reason == "org",
         )
         .values(status="error", error_message=error, updated_at=datetime.now(UTC))
     )

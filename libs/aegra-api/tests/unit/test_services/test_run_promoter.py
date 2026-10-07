@@ -1,5 +1,6 @@
 """Unit tests for the queued-run promoter."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from aegra_api.services import run_promoter as mod
 from aegra_api.services.run_limits import ExpiredRun
 from aegra_api.services.run_promoter import RunPromoter
+from aegra_api.services.run_queue_signal import RunQueueSignal
 
 WEBHOOK = "https://app.example.test/webhooks/ai/run"
 
@@ -47,7 +49,7 @@ def _patch_lookups(
     promotable: list[str] | None = None,
     expired: list[object] | None = None,
 ) -> None:
-    monkeypatch.setattr(mod.run_limits, "find_promotable_runs", AsyncMock(return_value=promotable or []))
+    monkeypatch.setattr(mod, "find_promotable_runs", AsyncMock(return_value=promotable or []))
     monkeypatch.setattr(mod.run_limits, "find_expired_queued_runs", AsyncMock(return_value=expired or []))
 
 
@@ -92,6 +94,8 @@ class TestQueueExpiry:
         self, monkeypatch: pytest.MonkeyPatch, promote_calls: AsyncMock, terminal_calls: tuple
     ) -> None:
         claim, webhook = terminal_calls
+        notify = MagicMock()
+        monkeypatch.setattr(mod.run_queue_signal, "notify", notify)
         _patch_lookups(monkeypatch, expired=[_expired()])
 
         await RunPromoter().tick()
@@ -100,6 +104,7 @@ class TestQueueExpiry:
         assert webhook.await_args.kwargs["status"] == "error"
         assert webhook.await_args.kwargs["webhook_url"] == WEBHOOK
         assert webhook.await_args.kwargs["error_message"] == mod._QUEUE_EXPIRY_ERROR
+        notify.assert_called_once()
 
     async def test_run_without_webhook_is_still_failed(
         self, monkeypatch: pytest.MonkeyPatch, promote_calls: AsyncMock, terminal_calls: tuple
@@ -158,7 +163,7 @@ class TestQueueExpiry:
         claim, _ = terminal_calls
         claim.side_effect = lambda *a, **k: order.append("expire") or True
         monkeypatch.setattr(
-            mod.run_limits,
+            mod,
             "find_promotable_runs",
             AsyncMock(side_effect=lambda *a, **k: order.append("promote") or []),
         )
@@ -181,3 +186,86 @@ class TestLifecycle:
         await promoter.stop()
 
         assert promoter._task is None
+
+    async def test_signal_wakes_loop_for_immediate_second_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        promoter = RunPromoter()
+        promoter._running = True
+        tick = AsyncMock()
+
+        async def stop_after_second_tick() -> None:
+            if tick.await_count == 2:
+                promoter._running = False
+
+        tick.side_effect = stop_after_second_tick
+        monkeypatch.setattr(promoter, "tick", tick)
+        signal = MagicMock()
+        signal.clear = MagicMock()
+        signal.wait = AsyncMock(return_value=True)
+        monkeypatch.setattr(mod, "run_queue_signal", signal)
+
+        await promoter._loop()
+
+        assert tick.await_count == 2
+        signal.wait.assert_awaited_once()
+        assert signal.clear.call_count == 2
+
+    async def test_periodic_timeout_runs_another_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        promoter = RunPromoter()
+        promoter._running = True
+        tick = AsyncMock()
+
+        async def stop_after_second_tick() -> None:
+            if tick.await_count == 2:
+                promoter._running = False
+
+        tick.side_effect = stop_after_second_tick
+        monkeypatch.setattr(promoter, "tick", tick)
+        signal = MagicMock()
+        signal.clear = MagicMock()
+        signal.wait = AsyncMock(return_value=False)
+        monkeypatch.setattr(mod, "run_queue_signal", signal)
+
+        await promoter._loop()
+
+        assert tick.await_count == 2
+        signal.wait.assert_awaited_once()
+
+    async def test_signal_arriving_during_tick_survives_until_wait(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        promoter = RunPromoter()
+        promoter._running = True
+        signal = RunQueueSignal()
+        ticks = 0
+
+        async def tick() -> None:
+            nonlocal ticks
+            ticks += 1
+            if ticks == 1:
+                signal.notify()
+            else:
+                promoter._running = False
+
+        monkeypatch.setattr(promoter, "tick", tick)
+        monkeypatch.setattr(mod, "run_queue_signal", signal)
+
+        await asyncio.wait_for(promoter._loop(), timeout=0.1)
+
+        assert ticks == 2
+
+
+class TestRunQueueSignal:
+    async def test_notify_wakes_waiter_and_clear_rearms_it(self) -> None:
+        signal = RunQueueSignal()
+        signal.notify()
+
+        assert await signal.wait(0.01)
+        signal.clear()
+        assert not await signal.wait(0.001)

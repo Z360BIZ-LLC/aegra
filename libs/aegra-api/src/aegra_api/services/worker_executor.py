@@ -20,7 +20,7 @@ import structlog
 from asgi_correlation_id import correlation_id
 from redis import RedisError
 from redis import TimeoutError as RedisTimeoutError
-from sqlalchemy import Select, select, update
+from sqlalchemy import select, update
 
 from aegra_api.core.active_runs import active_runs, explicit_run_cancellations
 from aegra_api.core.orm import Run as RunORM
@@ -28,9 +28,12 @@ from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
 from aegra_api.observability.span_enrichment import merge_run_metadata, set_trace_context
-from aegra_api.services import run_limits
 from aegra_api.services.base_executor import BaseExecutor
-from aegra_api.services.run_admission import AdmissionOutcome, try_start_run
+from aegra_api.services.run_admission import (
+    AdmissionOutcome,
+    find_promotable_runs,
+    try_start_run,
+)
 from aegra_api.services.run_executor import (
     _lease_loss_cancellations,
     _shutdown_cancellations,
@@ -397,36 +400,16 @@ class WorkerExecutor(BaseExecutor):
 
     @staticmethod
     async def _poll_postgres() -> str | None:
-        """Pick the oldest pending, unclaimed run from Postgres.
-
-        Skips runs whose org is at its limit, otherwise this fallback would
-        return the same blocked run on every poll while Redis is down.
-        """
+        """Pick one thread- and org-eligible run from PostgreSQL."""
         maker = _get_session_maker()
         async with maker() as session:
-            if settings.run_limits.enforcing:
-                promotable = await run_limits.find_promotable_runs(session, batch_size=1)
-                if promotable:
-                    return promotable[0]
-                # Runs with no tenant are never gated, so pick them up
-                # immediately rather than waiting out the promoter's
-                # stuck-run threshold on this already-degraded path.
-                return await session.scalar(_oldest_pending_stmt(unscoped_only=True))
-
-            return await session.scalar(_oldest_pending_stmt(unscoped_only=False))
+            promotable = await find_promotable_runs(session, batch_size=1)
+            return promotable[0] if promotable else None
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
-
-
-def _oldest_pending_stmt(*, unscoped_only: bool) -> Select[tuple[str]]:
-    """Select the oldest unclaimed pending run, optionally only tenant-less ones."""
-    stmt = select(RunORM.run_id).where(RunORM.status == "pending", RunORM.claimed_by.is_(None))
-    if unscoped_only:
-        stmt = stmt.where(RunORM.org_id.is_(None))
-    return stmt.order_by(RunORM.created_at.asc()).limit(1)
 
 
 async def _get_run_identity(run_id: str) -> tuple[str, str] | None:

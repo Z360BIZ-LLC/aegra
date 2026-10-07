@@ -7,7 +7,6 @@ import pytest
 from aegra_api.services import run_limits
 from aegra_api.services.run_limits import (
     LimitDecision,
-    find_promotable_runs,
     limit_for,
     max_limit,
     resolve_org_id,
@@ -104,70 +103,6 @@ class TestLimitDecision:
         assert not LimitDecision(org_id=ORG, active=1, limit=2).at_capacity
 
 
-class TestFindPromotableRuns:
-    async def test_skips_orgs_that_are_at_capacity(self, limits: None) -> None:
-        session = _session(
-            execute=[
-                _result(rows=[("full-org", 2), ("free-org", 1)]),
-                _result(rows=[("run-full", "full-org"), ("run-free", "free-org")]),
-                _result(rows=[]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=10) == ["run-free"]
-
-    async def test_counts_promotions_against_remaining_capacity(self, limits: None) -> None:
-        """Two free slots means two runs promoted, not the whole backlog."""
-        session = _session(
-            execute=[
-                _result(rows=[]),
-                _result(rows=[("run-1", ORG), ("run-2", ORG), ("run-3", ORG)]),
-                _result(rows=[]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=10) == ["run-1", "run-2"]
-
-    async def test_stops_at_batch_size(self, monkeypatch: pytest.MonkeyPatch, limits: None) -> None:
-        monkeypatch.setattr(settings.run_limits, "ORG_MAX_CONCURRENT_RUNS", 50)
-        session = _session(
-            execute=[
-                _result(rows=[]),
-                _result(rows=[("run-1", ORG), ("run-2", ORG), ("run-3", ORG)]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=2) == ["run-1", "run-2"]
-
-    async def test_returns_empty_when_nothing_is_queued(self, limits: None) -> None:
-        session = _session(execute=[_result(rows=[]), _result(rows=[]), _result(rows=[])])
-
-        assert await find_promotable_runs(session, batch_size=10) == []
-
-    async def test_recovers_long_pending_runs_that_have_no_org(self, limits: None) -> None:
-        """Exempt runs are never gated, so the promoter is their only safety net."""
-        session = _session(
-            execute=[
-                _result(rows=[]),
-                _result(rows=[]),
-                _result(rows=[("run-orphan",)]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=10) == ["run-orphan"]
-
-    async def test_org_less_recovery_does_not_exceed_batch_size(self, limits: None) -> None:
-        """A full batch of org-scoped runs leaves no room for the orphan sweep."""
-        session = _session(
-            execute=[
-                _result(rows=[]),
-                _result(rows=[("run-1", ORG), ("run-2", ORG)]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=2) == ["run-1", "run-2"]
-
-
 class TestStaleRunsAreNotCounted:
     async def test_count_query_excludes_expired_leases_and_old_rows(self, limits: None) -> None:
         """The count must filter on lease expiry and age, not just status."""
@@ -178,3 +113,33 @@ class TestStaleRunsAreNotCounted:
         rendered = str(session.scalar.await_args.args[0])
         assert "lease_expires_at" in rendered
         assert "created_at" in rendered
+
+
+class TestQueueExpiry:
+    async def test_only_org_blocked_runs_expire_from_reason_timestamp(
+        self,
+        limits: None,
+    ) -> None:
+        session = _session(execute=[_result(rows=[])])
+
+        await run_limits.find_expired_queued_runs(session, batch_size=10)
+
+        statement = str(session.execute.await_args.args[0])
+        assert "pending_reason" in statement
+        assert "pending_reason_at" in statement
+        assert "created_at" not in statement
+
+    async def test_expiry_claim_is_guarded_by_org_reason(
+        self,
+        limits: None,
+    ) -> None:
+        session = _session(execute=[_result(rowcount=1)])
+
+        assert await run_limits.claim_expired_run(
+            session,
+            "run-1",
+            error="expired",
+        )
+
+        statement = str(session.execute.await_args.args[0])
+        assert "pending_reason" in statement

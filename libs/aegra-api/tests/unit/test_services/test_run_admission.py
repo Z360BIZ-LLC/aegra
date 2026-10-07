@@ -15,9 +15,15 @@ RUN_ID = "run-1"
 THREAD_ID = "thread-1"
 
 
-def _result(*, first: object = None, rowcount: int = 1) -> MagicMock:
+def _result(
+    *,
+    first: object = None,
+    rows: list[tuple[str, str | None]] | None = None,
+    rowcount: int = 1,
+) -> MagicMock:
     result = MagicMock()
     result.first.return_value = first
+    result.all.return_value = rows or []
     result.rowcount = rowcount
     return result
 
@@ -242,3 +248,67 @@ class TestPredecessorQuery:
         statement = str(session.scalar.await_args.args[0])
         assert "runs.queue_position <" in statement
         assert "runs.status IN" in statement
+
+
+class TestFindPromotableRuns:
+    async def test_selects_enqueue_thread_heads_and_non_enqueue_runs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session = _session(_result(rows=[("head-a", ORG), ("head-b", "org-2"), ("rollback", None)]))
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "active_counts_by_org",
+            AsyncMock(return_value={}),
+        )
+
+        result = await run_admission.find_promotable_runs(session, batch_size=10)
+
+        assert result == ["head-a", "head-b", "rollback"]
+        statement = str(session.execute.await_args.args[0])
+        assert "NOT EXISTS" in statement
+        assert "multitask_strategy" in statement
+        assert "queue_position" in statement
+        assert "pending_reason" in statement
+
+    async def test_projects_org_capacity_and_preserves_cross_org_fairness(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
+        monkeypatch.setattr(settings.run_limits, "ORG_MAX_CONCURRENT_RUNS", 2)
+        session = _session(
+            _result(
+                rows=[
+                    ("org-1-first", ORG),
+                    ("org-2-first", "org-2"),
+                    ("org-1-second", ORG),
+                ]
+            )
+        )
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "active_counts_by_org",
+            AsyncMock(return_value={ORG: 1}),
+        )
+
+        result = await run_admission.find_promotable_runs(session, batch_size=10)
+
+        assert result == ["org-1-first", "org-2-first"]
+
+    async def test_limits_batch_and_recovers_stale_unscoped_runs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session = _session(_result(rows=[("stale-unscoped", None), ("other-thread", None)]))
+        monkeypatch.setattr(
+            run_admission.run_limits,
+            "active_counts_by_org",
+            AsyncMock(return_value={}),
+        )
+
+        result = await run_admission.find_promotable_runs(session, batch_size=1)
+
+        assert result == ["stale-unscoped"]
+        params = session.execute.await_args.args[1]
+        assert params["stuck_before"] < datetime.now(params["stuck_before"].tzinfo)
