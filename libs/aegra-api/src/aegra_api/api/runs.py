@@ -84,6 +84,25 @@ async def _request_run_interruption(
         await streaming_service.cancel_run(run_orm.run_id)
 
 
+async def _wait_for_run_release(
+    session: AsyncSession,
+    run_id: str,
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """Wait until cancellation is terminal and no executor owns the run."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        session.expire_all()
+        state = await session.execute(select(RunORM.status, RunORM.claimed_by).where(RunORM.run_id == run_id))
+        row = state.one_or_none()
+        if row is None or (row.status in TERMINAL_STATES and row.claimed_by is None):
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
 async def _apply_create_run_auth(user: User, thread_id: str, request: RunCreate) -> None:
     """Authorize threads.create_run and merge config/context overrides into request.
 
@@ -571,15 +590,21 @@ async def delete_run(
             detail="Run is active. Retry with force=1 to cancel and delete.",
         )
 
-    # If forcing and active, cancel first
+    # If forcing and active, cancel first. Do not delete the durable predecessor
+    # until its executor has stopped and relinquished the lease: Redis publish
+    # only acknowledges delivery of a cancellation request, not completion.
     if force and run_orm.status in ["pending", "running"]:
         logger.info(f"[delete_run] force-cancelling active run run_id={run_id}")
-        await streaming_service.cancel_run(run_id)
-        # Best-effort: wait for bg task to settle
+        await _request_run_interruption(session, run_orm, "cancel")
         task = active_runs.get(run_id)
         if task:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        if not await _wait_for_run_release(session, run_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Run cancellation is still in progress; retry deletion.",
+            )
 
     # Delete the record
     await session.execute(

@@ -174,6 +174,12 @@ async def update_thread_metadata(
         session.add(thread_orm)
         return
 
+    if user_id is None or thread.user_id != user_id:
+        # This check intentionally runs after the thread advisory lock in
+        # _prepare_run. Two users racing to auto-create the same thread ID
+        # cannot let the lock loser mutate the winner's newly-created row.
+        raise HTTPException(404, f"Thread '{thread_id}' not found")
+
     md = dict(getattr(thread, "metadata_json", {}) or {})
     md.update(
         {
@@ -185,7 +191,12 @@ async def update_thread_metadata(
     if thread_name and not md.get("thread_name"):
         md["thread_name"] = thread_name
     await session.execute(
-        update(ThreadORM).where(ThreadORM.thread_id == thread_id).values(metadata_json=md, updated_at=datetime.now(UTC))
+        update(ThreadORM)
+        .where(
+            ThreadORM.thread_id == thread_id,
+            ThreadORM.user_id == user_id,
+        )
+        .values(metadata_json=md, updated_at=datetime.now(UTC))
     )
 
 

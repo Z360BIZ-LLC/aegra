@@ -23,7 +23,7 @@ from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.models import Run, RunCreate, RunStatus, User
-from aegra_api.services.run_preparation import _prepare_run
+from aegra_api.services.run_preparation import _prepare_run, update_thread_metadata
 
 
 class TestRunsEndpoints:
@@ -32,6 +32,28 @@ class TestRunsEndpoints:
     @pytest.fixture
     def mock_user(self) -> User:
         return User(identity="test-user", scopes=[])
+
+    @pytest.mark.asyncio
+    async def test_metadata_update_rejects_thread_owned_by_another_user(self) -> None:
+        session = AsyncMock()
+        session.scalar.return_value = ThreadORM(
+            thread_id="shared-id",
+            user_id="first-user",
+            status="idle",
+            metadata_json={},
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await update_thread_metadata(
+                session,
+                "shared-id",
+                "assistant",
+                "graph",
+                user_id="second-user",
+            )
+
+        assert exc_info.value.status_code == 404
+        session.execute.assert_not_awaited()
 
     @pytest.fixture
     def mock_session(self) -> AsyncMock:
@@ -450,6 +472,52 @@ class TestRunsEndpoints:
 
         notify.assert_called_once()
         assert order == ["commit", "notify"]
+
+    @pytest.mark.asyncio
+    async def test_force_delete_waits_for_executor_release(
+        self,
+        mock_user: User,
+        mock_session: AsyncMock,
+    ) -> None:
+        run_orm = RunORM(
+            run_id="run-123",
+            thread_id="test-thread",
+            assistant_id="agent",
+            user_id=mock_user.identity,
+            status="running",
+            claimed_by="remote-worker",
+            input={},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        mock_session.scalar.return_value = run_orm
+
+        with (
+            patch("aegra_api.api.runs.handle_event", new_callable=AsyncMock),
+            patch(
+                "aegra_api.api.runs._request_run_interruption",
+                new_callable=AsyncMock,
+            ) as interrupt,
+            patch(
+                "aegra_api.api.runs._wait_for_run_release",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as wait_release,
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await delete_run(
+                "test-thread",
+                "run-123",
+                1,
+                mock_user,
+                mock_session,
+            )
+
+        assert exc_info.value.status_code == 409
+        interrupt.assert_awaited_once_with(mock_session, run_orm, "cancel")
+        wait_release.assert_awaited_once_with(mock_session, "run-123")
+        mock_session.execute.assert_not_awaited()
+        mock_session.commit.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_update_run_does_not_overwrite_terminal_status(
