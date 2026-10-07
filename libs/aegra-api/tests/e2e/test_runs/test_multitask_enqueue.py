@@ -133,6 +133,26 @@ async def test_omitted_strategy_preserves_both_state_updates_fifo(
     assert _values(completed) == ["first", "second"]
 
 
+async def test_concurrent_http_creates_preserve_every_state_update(
+    client: httpx.AsyncClient,
+) -> None:
+    """Simultaneous requests may commit in any order, but none may be lost."""
+    thread_id = await _thread(client)
+    labels = [f"concurrent-{index}" for index in range(6)]
+    created = await asyncio.gather(
+        *(_create(client, thread_id, label, delay=0.15) for label in labels)
+    )
+
+    completed = await asyncio.gather(
+        *(_wait_terminal(client, thread_id, run["run_id"]) for run in created)
+    )
+    outputs = [_values(run) for run in completed]
+    final_values = max(outputs, key=len)
+
+    assert len(final_values) == len(labels)
+    assert set(final_values) == set(labels)
+
+
 async def test_explicit_enqueue_matches_default(client: httpx.AsyncClient) -> None:
     thread_id = await _thread(client)
     first = await _create(
@@ -210,6 +230,26 @@ async def test_queued_cancellation_releases_following_run(
     assert _values(completed) == ["kept", "following"]
 
 
+async def test_force_delete_waits_for_running_predecessor_before_promotion(
+    client: httpx.AsyncClient,
+) -> None:
+    thread_id = await _thread(client)
+    predecessor = await _create(client, thread_id, "deleted", delay=1.5)
+    successor = await _create(client, thread_id, "after-delete")
+    await _wait_status(client, thread_id, predecessor["run_id"], {"running"})
+    await _wait_status(client, thread_id, successor["run_id"], {"pending"})
+
+    response = await client.delete(
+        f"/threads/{thread_id}/runs/{predecessor['run_id']}",
+        params={"force": 1},
+    )
+    response.raise_for_status()
+
+    completed = await _wait_terminal(client, thread_id, successor["run_id"])
+    assert completed["status"] == "success"
+    assert _values(completed) == ["after-delete"]
+
+
 async def test_explicit_checkpoint_is_not_reinterpreted_while_queued(
     client: httpx.AsyncClient,
 ) -> None:
@@ -237,7 +277,8 @@ async def test_thread_fifo_composes_with_org_capacity(
     client: httpx.AsyncClient,
 ) -> None:
     org_id = f"enqueue-{uuid.uuid4().hex[:8]}"
-    first_thread, second_thread = await asyncio.gather(
+    first_thread, second_thread, third_thread = await asyncio.gather(
+        _thread(client),
         _thread(client),
         _thread(client),
     )
@@ -261,19 +302,30 @@ async def test_thread_fifo_composes_with_org_capacity(
         delay=1.0,
         org_id=org_id,
     )
+    third_head = await _create(
+        client,
+        third_thread,
+        "org-third-thread",
+        delay=1.0,
+        org_id=org_id,
+    )
 
     await asyncio.sleep(0.3)
     states = await asyncio.gather(
         _get_run(client, first_thread, first["run_id"]),
         _get_run(client, first_thread, same_thread["run_id"]),
         _get_run(client, second_thread, other_thread["run_id"]),
+        _get_run(client, third_thread, third_head["run_id"]),
     )
-    assert sum(run["status"] == "running" for run in states) <= 2
+    heads = [states[0], states[2], states[3]]
+    assert sum(run["status"] == "running" for run in heads) <= 2
+    assert any(run["status"] == "pending" for run in heads)
     assert states[1]["status"] == "pending"
 
     completed = await asyncio.gather(
         _wait_terminal(client, first_thread, first["run_id"]),
         _wait_terminal(client, first_thread, same_thread["run_id"]),
         _wait_terminal(client, second_thread, other_thread["run_id"]),
+        _wait_terminal(client, third_thread, third_head["run_id"]),
     )
     assert all(run["status"] == "success" for run in completed)
