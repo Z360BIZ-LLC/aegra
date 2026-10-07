@@ -203,7 +203,9 @@ class TestStatelessWaitForRun:
             async def commit(self) -> None:
                 pass
 
-            async def execute(self, stmt: object) -> object:
+            async def execute(
+                self, stmt: object, params: object | None = None
+            ) -> object:
                 class Result:
                     rowcount = 1
 

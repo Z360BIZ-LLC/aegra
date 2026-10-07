@@ -819,7 +819,7 @@ class TestWaitForRunTimeouts:
             async def commit(self):
                 pass
 
-            async def execute(self, stmt):
+            async def execute(self, stmt, params=None):
                 class Result:
                     rowcount = 1
 

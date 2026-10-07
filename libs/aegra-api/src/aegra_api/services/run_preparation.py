@@ -24,6 +24,7 @@ from aegra_api.models import Run, RunCreate, User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
+from aegra_api.services.run_admission import lock_thread
 from aegra_api.services.run_limits import resolve_org_id
 from aegra_api.services.run_status import set_thread_status
 from aegra_api.utils.assistants import resolve_assistant_id
@@ -246,6 +247,9 @@ async def _prepare_run(
     if assistant.graph_id not in available_graphs:
         raise HTTPException(404, f"Graph '{assistant.graph_id}' not found for assistant")
 
+    effective_strategy = request.multitask_strategy or "enqueue"
+    await lock_thread(session, thread_id)
+
     # Mark thread as busy and update metadata
     await update_thread_metadata(
         session, thread_id, assistant.assistant_id, assistant.graph_id, user_id=user.identity, input_data=request.input
@@ -268,7 +272,7 @@ async def _prepare_run(
         behavior=RunBehavior(
             interrupt_before=request.interrupt_before,
             interrupt_after=request.interrupt_after,
-            multitask_strategy=request.multitask_strategy,
+            multitask_strategy=effective_strategy,
             subgraphs=request.stream_subgraphs or False,
             webhook_url=request.webhook,
         ),
@@ -297,6 +301,7 @@ async def _prepare_run(
         context=context,
         user_id=user.identity,
         org_id=resolve_org_id(config, request.metadata),
+        multitask_strategy=effective_strategy,
         created_at=now,
         updated_at=now,
         output=None,
@@ -305,6 +310,7 @@ async def _prepare_run(
     )
     session.add(run_orm)
     await session.commit()
+    await session.refresh(run_orm)
     emit_metric(
         "RunsCreated",
         1,
@@ -314,6 +320,8 @@ async def _prepare_run(
             "user_id": user.identity,
             "graph_id": assistant.graph_id,
             "initial_status": initial_status,
+            "multitask_strategy": effective_strategy,
+            "queue_position": run_orm.queue_position,
         },
     )
     if request.webhook:
@@ -339,8 +347,15 @@ async def _prepare_run(
             "thread_id": thread_id,
             "graph_id": assistant.graph_id,
             "initial_status": initial_status,
+            "multitask_strategy": effective_strategy,
+            "queue_position": run_orm.queue_position,
         },
     )
-    logger.info("Submitted run to executor", run_id=run_id)
+    logger.info(
+        "Submitted run to executor",
+        run_id=run_id,
+        multitask_strategy=effective_strategy,
+        queue_position=run_orm.queue_position,
+    )
 
     return run_id, run, job

@@ -1,5 +1,6 @@
 """Unit tests for standard run endpoints (create, get, list, update, join)."""
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -21,6 +22,7 @@ from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.models import Run, RunCreate, RunStatus, User
+from aegra_api.services.run_preparation import _prepare_run
 
 
 class TestRunsEndpoints:
@@ -83,6 +85,10 @@ class TestRunsEndpoints:
             ),
             patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.set_thread_status", new_callable=AsyncMock),
+            patch(
+                "aegra_api.services.run_preparation.lock_thread",
+                new_callable=AsyncMock,
+            ) as mock_lock_thread,
             patch("aegra_api.services.run_preparation.uuid4", return_value=run_id),
             patch(
                 "aegra_api.services.run_preparation.executor.submit",
@@ -103,13 +109,110 @@ class TestRunsEndpoints:
             assert result.thread_id == thread_id
             assert result.status == "pending"
             assert result.input == {"message": "hello"}
+            assert result.multitask_strategy == "enqueue"
 
             # Verify DB interactions
             mock_session.add.assert_called_once()
             mock_session.commit.assert_called_once()
+            run_orm = mock_session.add.call_args.args[0]
+            assert run_orm.multitask_strategy == "enqueue"
+            mock_lock_thread.assert_awaited_once_with(mock_session, thread_id)
+            mock_session.refresh.assert_awaited_once_with(run_orm)
 
             # Verify background execution submission
             mock_submit.assert_awaited_once()
+            job = mock_submit.await_args.args[0]
+            assert job.behavior.multitask_strategy == "enqueue"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_creation_holds_thread_lock_through_commit(
+        self,
+        mock_user: User,
+        sample_assistant: AssistantORM,
+    ) -> None:
+        """A later request cannot persist before the first transaction commits."""
+        transaction_lock = asyncio.Lock()
+        first_commit_entered = asyncio.Event()
+        release_first_commit = asyncio.Event()
+        next_position = 0
+
+        class Session:
+            def __init__(self, *, block_commit: bool) -> None:
+                self.block_commit = block_commit
+                self.run_orm: RunORM | None = None
+
+            async def scalar(self, _stmt: object) -> AssistantORM:
+                return sample_assistant
+
+            def add(self, run_orm: RunORM) -> None:
+                self.run_orm = run_orm
+
+            async def commit(self) -> None:
+                nonlocal next_position
+                if self.block_commit:
+                    first_commit_entered.set()
+                    await release_first_commit.wait()
+                next_position += 1
+                assert self.run_orm is not None
+                self.run_orm.queue_position = next_position
+                transaction_lock.release()
+
+            async def refresh(self, _run_orm: RunORM) -> None:
+                return None
+
+        first_session = Session(block_commit=True)
+        second_session = Session(block_commit=False)
+
+        async def lock_thread(_session: object, _thread_id: str) -> None:
+            await transaction_lock.acquire()
+
+        request = RunCreate(assistant_id="test-assistant", input={})
+        with (
+            patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
+            patch(
+                "aegra_api.services.run_preparation.resolve_assistant_id",
+                return_value="test-assistant",
+            ),
+            patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.set_thread_status", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.lock_thread", side_effect=lock_thread),
+            patch("aegra_api.services.run_preparation.executor.submit", new_callable=AsyncMock),
+            patch(
+                "aegra_api.services.run_preparation.uuid4",
+                side_effect=[uuid4(), uuid4()],
+            ),
+        ):
+            mock_lg_service.return_value.list_graphs.return_value = ["test-graph"]
+            first = asyncio.create_task(
+                _prepare_run(
+                    first_session,  # type: ignore[arg-type]
+                    "thread-1",
+                    request,
+                    mock_user,
+                    initial_status="pending",
+                )
+            )
+            await first_commit_entered.wait()
+            second = asyncio.create_task(
+                _prepare_run(
+                    second_session,  # type: ignore[arg-type]
+                    "thread-1",
+                    request,
+                    mock_user,
+                    initial_status="pending",
+                )
+            )
+            await asyncio.sleep(0)
+
+            assert second_session.run_orm is None
+            release_first_commit.set()
+            await asyncio.gather(first, second)
+
+        assert first_session.run_orm is not None
+        assert second_session.run_orm is not None
+        assert first_session.run_orm.queue_position == 1
+        assert second_session.run_orm.queue_position == 2
 
     @pytest.mark.asyncio
     async def test_create_run_assistant_not_found(
