@@ -139,13 +139,9 @@ async def test_concurrent_http_creates_preserve_every_state_update(
     """Simultaneous requests may commit in any order, but none may be lost."""
     thread_id = await _thread(client)
     labels = [f"concurrent-{index}" for index in range(6)]
-    created = await asyncio.gather(
-        *(_create(client, thread_id, label, delay=0.15) for label in labels)
-    )
+    created = await asyncio.gather(*(_create(client, thread_id, label, delay=0.15) for label in labels))
 
-    completed = await asyncio.gather(
-        *(_wait_terminal(client, thread_id, run["run_id"]) for run in created)
-    )
+    completed = await asyncio.gather(*(_wait_terminal(client, thread_id, run["run_id"]) for run in created))
     outputs = [_values(run) for run in completed]
     final_values = max(outputs, key=len)
 

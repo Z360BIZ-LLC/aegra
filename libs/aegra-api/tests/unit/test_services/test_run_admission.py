@@ -387,9 +387,7 @@ class TestFindPromotableRuns:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        session = _session(
-            _result(rows=[("stale-unscoped", None, 1, True), ("other-thread", None, 2, True)])
-        )
+        session = _session(_result(rows=[("stale-unscoped", None, 1, True), ("other-thread", None, 2, True)]))
         monkeypatch.setattr(
             run_admission.run_limits,
             "active_counts_by_org",

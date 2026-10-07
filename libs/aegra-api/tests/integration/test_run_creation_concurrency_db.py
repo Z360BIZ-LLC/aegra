@@ -35,6 +35,7 @@ async def test_concurrent_auto_create_does_not_cross_user_thread_ownership() -> 
 
         session_maker = async_sessionmaker(engine, expire_on_commit=False)
         first_has_created = asyncio.Event()
+
         async def create_for_user(user_id: str, assistant_id: str, *, hold_lock: bool = False) -> None:
             async with session_maker() as session:
                 await lock_thread(session, thread_id)

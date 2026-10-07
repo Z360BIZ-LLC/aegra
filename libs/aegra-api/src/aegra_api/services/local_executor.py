@@ -79,9 +79,7 @@ class LocalExecutor(BaseExecutor):
         task = asyncio.create_task(execute_run(job), context=trace_ctx)
         active_runs[job.identity.run_id] = task
         self._job_tasks[job.identity.run_id] = task
-        task.add_done_callback(
-            lambda completed, run_id=job.identity.run_id: self._job_tasks.pop(run_id, None)
-        )
+        task.add_done_callback(lambda completed, run_id=job.identity.run_id: self._job_tasks.pop(run_id, None))
         keeper = asyncio.create_task(self._keep_lease(job.identity.run_id, task))
         self._lease_tasks.add(keeper)
         keeper.add_done_callback(self._lease_tasks.discard)
