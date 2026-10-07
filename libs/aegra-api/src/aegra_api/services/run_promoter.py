@@ -62,6 +62,12 @@ class RunPromoter:
     async def _loop(self) -> None:
         interval = settings.run_limits.ORG_RUN_PROMOTER_INTERVAL_SECONDS
         while self._running:
+            try:
+                await run_queue_signal.wait(interval)
+            except asyncio.CancelledError:
+                break
+            if not self._running:
+                break
             run_queue_signal.clear()
             try:
                 await self.tick()
@@ -69,12 +75,6 @@ class RunPromoter:
                 break
             except Exception:
                 logger.exception("Error in run promoter")
-            if not self._running:
-                break
-            try:
-                await run_queue_signal.wait(interval)
-            except asyncio.CancelledError:
-                break
 
     async def tick(self) -> None:
         """Expire overdue runs, then dispatch what capacity allows.

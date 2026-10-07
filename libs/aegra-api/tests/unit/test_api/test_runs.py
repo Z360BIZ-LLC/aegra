@@ -13,6 +13,7 @@ from aegra_api.api.runs import (
     _apply_create_run_auth,
     _request_run_interruption,
     create_run,
+    delete_run,
     get_run,
     join_run,
     list_runs,
@@ -411,6 +412,44 @@ class TestRunsEndpoints:
             mock_session.execute.assert_not_awaited()
             mock_session.commit.assert_not_awaited()
             assert result.run_id == run_id
+
+    @pytest.mark.asyncio
+    async def test_delete_run_signals_queue_after_commit(
+        self,
+        mock_user: User,
+        mock_session: AsyncMock,
+    ) -> None:
+        run_orm = RunORM(
+            run_id="run-123",
+            thread_id="test-thread",
+            assistant_id="agent",
+            user_id=mock_user.identity,
+            status="success",
+            input={},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        mock_session.scalar.return_value = run_orm
+        order: list[str] = []
+        mock_session.commit.side_effect = lambda: order.append("commit")
+
+        with (
+            patch("aegra_api.api.runs.handle_event", new_callable=AsyncMock),
+            patch(
+                "aegra_api.api.runs.run_queue_signal.notify",
+                side_effect=lambda: order.append("notify"),
+            ) as notify,
+        ):
+            await delete_run(
+                "test-thread",
+                "run-123",
+                0,
+                mock_user,
+                mock_session,
+            )
+
+        notify.assert_called_once()
+        assert order == ["commit", "notify"]
 
     @pytest.mark.asyncio
     async def test_update_run_does_not_overwrite_terminal_status(

@@ -79,6 +79,7 @@ class TestFinalizeRun:
                 "aegra_api.services.run_status.set_thread_status_if_no_active_runs",
                 new_callable=AsyncMock,
             ) as mock_set_thread,
+            patch("aegra_api.services.run_status.run_queue_signal.notify") as notify,
         ):
             finalized = await finalize_run(
                 "run-1",
@@ -95,6 +96,7 @@ class TestFinalizeRun:
         assert "user-1" in compiled.params.values()
         mock_set_thread.assert_awaited_once_with(session, ["thread-1"], "idle", user_id="user-1")
         session.commit.assert_awaited_once()
+        notify.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_serializes_output_and_records_error_when_provided(self) -> None:
@@ -164,6 +166,7 @@ class TestFinalizeRun:
                 "aegra_api.services.run_status.set_thread_status_if_no_active_runs",
                 new_callable=AsyncMock,
             ) as mock_set_thread,
+            patch("aegra_api.services.run_status.run_queue_signal.notify") as notify,
         ):
             finalized = await finalize_run(
                 "run-1",
@@ -177,6 +180,7 @@ class TestFinalizeRun:
         mock_set_thread.assert_not_awaited()
         session.commit.assert_not_awaited()
         session.rollback.assert_awaited_once()
+        notify.assert_not_called()
 
 
 class TestSetThreadStatus:
@@ -241,10 +245,13 @@ class TestInterruptUnownedRun:
         result.scalar_one_or_none.return_value = "run-1"
         session.execute = AsyncMock(return_value=result)
 
-        with patch(
-            "aegra_api.services.run_status.set_thread_status_if_no_active_runs",
-            new_callable=AsyncMock,
-        ) as mock_set_thread:
+        with (
+            patch(
+                "aegra_api.services.run_status.set_thread_status_if_no_active_runs",
+                new_callable=AsyncMock,
+            ) as mock_set_thread,
+            patch("aegra_api.services.run_status.run_queue_signal.notify") as notify,
+        ):
             interrupted = await interrupt_unowned_run(session, "run-1", "thread-1", user_id="user-1")
 
         assert interrupted is True
@@ -257,6 +264,7 @@ class TestInterruptUnownedRun:
         assert "user-1" in compiled.params.values()
         mock_set_thread.assert_awaited_once_with(session, ["thread-1"], "idle", user_id="user-1")
         session.commit.assert_awaited_once()
+        notify.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_does_not_commit_when_live_owner_wins_race(self) -> None:
@@ -265,15 +273,19 @@ class TestInterruptUnownedRun:
         result.scalar_one_or_none.return_value = None
         session.execute = AsyncMock(return_value=result)
 
-        with patch(
-            "aegra_api.services.run_status.set_thread_status_if_no_active_runs",
-            new_callable=AsyncMock,
-        ) as mock_set_thread:
+        with (
+            patch(
+                "aegra_api.services.run_status.set_thread_status_if_no_active_runs",
+                new_callable=AsyncMock,
+            ) as mock_set_thread,
+            patch("aegra_api.services.run_status.run_queue_signal.notify") as notify,
+        ):
             interrupted = await interrupt_unowned_run(session, "run-1", "thread-1", user_id="user-1")
 
         assert interrupted is False
         mock_set_thread.assert_not_awaited()
         session.commit.assert_not_awaited()
+        notify.assert_not_called()
 
 
 class TestSafeSerialize:

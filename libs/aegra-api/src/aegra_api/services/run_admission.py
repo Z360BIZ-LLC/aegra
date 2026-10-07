@@ -32,6 +32,7 @@ _PROMOTABLE_CANDIDATES_SQL = text(
            AND candidate.claimed_by IS NULL
            AND (
                candidate.pending_reason IS NOT NULL
+               OR candidate.updated_at > candidate.created_at
                OR candidate.created_at < :stuck_before
            )
            AND (
@@ -173,17 +174,12 @@ async def find_promotable_runs(
     batch_size: int,
 ) -> list[str]:
     """Find durable queue heads, with projected org capacity and fairness."""
-    active = (
-        await run_limits.active_counts_by_org(session)
-        if settings.run_limits.enforcing
-        else {}
-    )
+    active = await run_limits.active_counts_by_org(session) if settings.run_limits.enforcing else {}
     scan_multiplier = max(10, run_limits.max_limit())
     candidates = await session.execute(
         _PROMOTABLE_CANDIDATES_SQL,
         {
-            "stuck_before": datetime.now(UTC)
-            - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS),
+            "stuck_before": datetime.now(UTC) - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS),
             "scan_limit": batch_size * scan_multiplier,
         },
     )

@@ -8,17 +8,16 @@ re-enqueues only retryable run IDs.
 
 import asyncio
 import contextlib
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import structlog
 from observability.cloudwatch_emf import emit_metric
-from redis import RedisError
 from sqlalchemy import select, update
 
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
-from aegra_api.core.redis_manager import redis_manager
 from aegra_api.observability.metrics import REAPER_RECOVERED_RUNS
+from aegra_api.services.run_queue_signal import run_queue_signal
 from aegra_api.services.run_status import set_thread_status_if_no_active_runs
 from aegra_api.settings import settings
 
@@ -61,46 +60,31 @@ class LeaseReaper:
                 logger.exception("Error in lease reaper")
 
     async def _reap(self) -> None:
-        """Find crashed workers and stuck pending runs, recover them."""
-        crashed, stuck_pending = await self._find_recoverable()
+        """Find crashed workers and recover their durable run rows."""
+        crashed = await self._find_recoverable()
 
-        if not crashed and not stuck_pending:
+        if not crashed:
             return
 
-        if crashed:
-            logger.warning("Reaping crashed worker runs", count=len(crashed), run_ids=crashed)
-            retryable, exhausted = await self._recover_crashed_runs(crashed)
-            if exhausted:
-                REAPER_RECOVERED_RUNS.labels(outcome="crashed_exhausted").inc(len(exhausted))
-                for run_id in exhausted:
-                    emit_metric("RunMaxRetriesExceeded", 1, properties={"run_id": run_id})
-            if retryable:
-                pushed = await self._reenqueue(retryable)
-                REAPER_RECOVERED_RUNS.labels(outcome="crashed_retried").inc(len(pushed))
-                for run_id in pushed:
-                    emit_metric("LeaseExpiredRecovered", 1, properties={"run_id": run_id})
-
-        # Stuck pending: just re-enqueue (never executed, no retry budget)
-        if stuck_pending:
-            logger.warning("Re-enqueueing stuck pending runs", count=len(stuck_pending), run_ids=stuck_pending)
-            pushed = await self._reenqueue(stuck_pending)
-            REAPER_RECOVERED_RUNS.labels(outcome="stuck_pending").inc(len(pushed))
-            for run_id in pushed:
-                emit_metric("StuckPendingRequeued", 1, properties={"run_id": run_id})
+        logger.warning("Reaping crashed worker runs", count=len(crashed), run_ids=crashed)
+        retryable, exhausted = await self._recover_crashed_runs(crashed)
+        if exhausted:
+            REAPER_RECOVERED_RUNS.labels(outcome="crashed_exhausted").inc(len(exhausted))
+            for run_id in exhausted:
+                emit_metric("RunMaxRetriesExceeded", 1, properties={"run_id": run_id})
+        if retryable:
+            REAPER_RECOVERED_RUNS.labels(outcome="crashed_retried").inc(len(retryable))
+            for run_id in retryable:
+                emit_metric("LeaseExpiredRecovered", 1, properties={"run_id": run_id})
 
         logger.info(
             "Lease recovery complete",
             crashed_recovered=len(crashed),
-            stuck_reenqueued=len(stuck_pending),
         )
 
     @staticmethod
-    async def _find_recoverable() -> tuple[list[str], list[str]]:
-        """Find two categories: crashed workers (expired lease) and stuck pending runs.
-
-        Returns (crashed_run_ids, stuck_pending_run_ids) separately so retry
-        budget is only charged to crashed runs, not stuck pending ones.
-        """
+    async def _find_recoverable() -> list[str]:
+        """Find running rows whose worker lease has expired."""
         now = datetime.now(UTC)
         maker = _get_session_maker()
         async with maker() as session:
@@ -111,24 +95,7 @@ class LeaseReaper:
                     RunORM.lease_expires_at < now,
                 )
             )
-            crashed = [row[0] for row in crashed_result.fetchall()]
-
-            # The run promoter owns pending runs while limits are enforcing:
-            # this sweep has no capacity check, so it would re-enqueue runs
-            # deliberately held behind an org's ceiling.
-            if settings.run_limits.enforcing:
-                return crashed, []
-
-            stuck_result = await session.execute(
-                select(RunORM.run_id).where(
-                    RunORM.status == "pending",
-                    RunORM.claimed_by.is_(None),
-                    RunORM.created_at < now - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS),
-                )
-            )
-            stuck_pending = [row[0] for row in stuck_result.fetchall()]
-
-        return crashed, stuck_pending
+            return [row[0] for row in crashed_result.fetchall()]
 
     @staticmethod
     async def _recover_crashed_runs(run_ids: list[str]) -> tuple[list[str], list[str]]:
@@ -217,34 +184,10 @@ class LeaseReaper:
                 )
             await session.commit()
 
-        return retryable, exhausted
+        if retryable or exhausted:
+            run_queue_signal.notify()
 
-    @staticmethod
-    async def _reenqueue(run_ids: list[str]) -> list[str]:
-        """Push run_ids to the worker queue. Returns only the IDs confirmed pushed."""
-        queue_key = settings.worker.WORKER_QUEUE_KEY
-        pushed: list[str] = []
-        if not settings.redis.REDIS_BROKER_ENABLED:
-            # Dev mode has no job queue; the rows are back to pending and the
-            # run promoter dispatches them on its next pass. Nothing was
-            # pushed, so report an empty list rather than claiming credit.
-            logger.info("Reset runs to pending for the promoter to dispatch", run_ids=run_ids)
-            return pushed
-        try:
-            client = redis_manager.get_client()
-            for run_id in run_ids:
-                await client.rpush(queue_key, run_id)  # type: ignore[arg-type]
-                pushed.append(run_id)
-                logger.info("Re-enqueued recovered run", run_id=run_id)
-        except RedisError:
-            unpushed = run_ids[len(pushed) :]
-            for run_id in unpushed:
-                emit_metric("RedisBrokerFallback", 1, properties={"run_id": run_id})
-            logger.warning(
-                "Redis unavailable during re-enqueue; workers will pick up via Postgres poll",
-                run_ids=unpushed,
-            )
-        return pushed
+        return retryable, exhausted
 
 
 lease_reaper = LeaseReaper()

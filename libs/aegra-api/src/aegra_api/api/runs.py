@@ -25,6 +25,7 @@ from aegra_api.models.enums import RunCancellationAction
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.run_preparation import _prepare_run
+from aegra_api.services.run_queue_signal import run_queue_signal
 from aegra_api.services.run_status import interrupt_unowned_run
 from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body
 from aegra_api.services.streaming_service import streaming_service
@@ -589,6 +590,7 @@ async def delete_run(
         )
     )
     await session.commit()
+    run_queue_signal.notify()
 
     # Clean up active task if exists
     task = active_runs.pop(run_id, None)

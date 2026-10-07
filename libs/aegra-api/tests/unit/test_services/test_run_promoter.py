@@ -88,6 +88,21 @@ class TestPromotion:
 
         assert promote.await_count == 2
 
+    async def test_later_scan_retries_failed_delivery(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        terminal_calls: tuple,
+    ) -> None:
+        promote = AsyncMock(side_effect=[RuntimeError("redis down"), None])
+        monkeypatch.setattr(mod.executor, "promote", promote)
+        _patch_lookups(monkeypatch, promotable=["run-1"])
+        promoter = RunPromoter()
+
+        await promoter.tick()
+        await promoter.tick()
+
+        assert promote.await_count == 2
+
 
 class TestQueueExpiry:
     async def test_expired_run_is_failed_and_webhooked(
@@ -209,7 +224,7 @@ class TestLifecycle:
         await promoter._loop()
 
         assert tick.await_count == 2
-        signal.wait.assert_awaited_once()
+        assert signal.wait.await_count == 2
         assert signal.clear.call_count == 2
 
     async def test_periodic_timeout_runs_another_tick(
@@ -234,7 +249,7 @@ class TestLifecycle:
         await promoter._loop()
 
         assert tick.await_count == 2
-        signal.wait.assert_awaited_once()
+        assert signal.wait.await_count == 2
 
     async def test_signal_arriving_during_tick_survives_until_wait(
         self,
@@ -255,6 +270,7 @@ class TestLifecycle:
 
         monkeypatch.setattr(promoter, "tick", tick)
         monkeypatch.setattr(mod, "run_queue_signal", signal)
+        signal.notify()
 
         await asyncio.wait_for(promoter._loop(), timeout=0.1)
 
