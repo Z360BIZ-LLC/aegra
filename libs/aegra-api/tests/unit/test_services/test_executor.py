@@ -181,13 +181,16 @@ class TestLocalExecutor:
 
     @pytest.mark.asyncio
     async def test_promote_skips_run_without_execution_params(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(LocalExecutor, "_load_job", AsyncMock(return_value=None))
-        claim = AsyncMock(return_value=AdmissionOutcome.CLAIMED)
-        monkeypatch.setattr(LocalExecutor, "_claim", claim)
+        acquire = AsyncMock(return_value=None)
+        monkeypatch.setattr(local_executor_module, "_acquire_and_load", acquire)
+        spawn = MagicMock()
+        monkeypatch.setattr(LocalExecutor, "_spawn", spawn)
 
-        await LocalExecutor().promote("run-missing")
+        executor = LocalExecutor()
+        await executor.promote("run-missing")
 
-        claim.assert_not_awaited()
+        acquire.assert_awaited_once_with("run-missing", executor._owner)
+        spawn.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_wait_for_completion_returns_on_done(self) -> None:
@@ -230,11 +233,17 @@ class TestLocalExecutor:
 
         task = asyncio.create_task(hang_forever())
         active_runs["run-hang"] = task
+        executor._job_tasks["run-hang"] = task
 
-        await executor.stop()
+        with patch(
+            "aegra_api.services.local_executor._requeue_drained_runs",
+            new_callable=AsyncMock,
+        ) as requeue:
+            await executor.stop()
         # Give event loop a tick to process cancellation
         await asyncio.sleep(0.01)
         assert task.done()
+        requeue.assert_awaited_once_with(["run-hang"])
         active_runs.pop("run-hang", None)
 
 
