@@ -26,6 +26,8 @@ _METADATA_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _METADATA_MAX_KEYS = 32
 _METADATA_MAX_VALUE_LEN = 512
 
+MultitaskStrategy = Literal["reject", "interrupt", "rollback", "enqueue"]
+
 
 class RunCreate(BaseModel):
     """Request model for creating runs"""
@@ -52,7 +54,7 @@ class RunCreate(BaseModel):
         description="Behavior after stateless run completes: 'delete' (default) removes the ephemeral thread, 'keep' preserves it.",
     )
 
-    multitask_strategy: str | None = Field(
+    multitask_strategy: MultitaskStrategy | None = Field(
         None,
         description="Strategy for handling concurrent runs on same thread: 'reject', 'interrupt', 'rollback', or 'enqueue'.",
     )
@@ -177,6 +179,10 @@ class Run(BaseModel):
     user_id: str = Field(..., description="Identifier of the user who owns this run.")
     created_at: datetime = Field(..., description="Timestamp when the run was created.")
     updated_at: datetime = Field(..., description="Timestamp when the run was last updated.")
+    multitask_strategy: MultitaskStrategy = Field(
+        "enqueue",
+        description="Effective strategy for handling concurrent runs on the same thread.",
+    )
 
     @field_validator("status", mode="before")
     @classmethod
