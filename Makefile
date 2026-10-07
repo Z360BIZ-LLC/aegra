@@ -146,6 +146,7 @@ ENQUEUE_HARNESS := libs/aegra-api/tests/e2e/harness/enqueue
 ENQUEUE_TEST := libs/aegra-api/tests/e2e/test_runs/test_multitask_enqueue.py
 ENQUEUE_LOCAL_PORT := 2031
 ENQUEUE_WORKER_PORT := 2032
+ENQUEUE_REMOTE_WORKER_PORT := 2033
 
 e2e-run-limits:
 	@docker compose up -d postgres $(if $(REDIS),redis,)
@@ -241,20 +242,30 @@ e2e-enqueue-worker:
 	export AEGRA_CONFIG=$(PWD)/$(ENQUEUE_HARNESS)/aegra.json; \
 	export SERVER_URL=http://127.0.0.1:$(ENQUEUE_WORKER_PORT); \
 	export AUTH_TYPE=noop BACKFILL_THREAD_STATE_ON_STARTUP=false; \
-	export REDIS_BROKER_ENABLED=true WORKER_COUNT=2 N_JOBS_PER_WORKER=10; \
+	export REDIS_BROKER_ENABLED=true N_JOBS_PER_WORKER=10; \
 	export REDIS_URL=redis://localhost:$$(docker compose port redis 6379 | cut -d: -f2)/4; \
 	export ORG_RUN_LIMIT_MODE=enforce ORG_MAX_CONCURRENT_RUNS=2; \
 	export ORG_RUN_PROMOTER_INTERVAL_SECONDS=0.2; \
-	cleanup() { kill $$server_pid 2>/dev/null || true; }; \
+	cleanup() { kill $$api_pid $$worker_pid 2>/dev/null || true; }; \
 	trap cleanup EXIT INT TERM; \
-	.venv/bin/python -m uvicorn aegra_api.main:app \
+	WORKER_COUNT=0 .venv/bin/python -m uvicorn aegra_api.main:app \
 		--host 127.0.0.1 --port $(ENQUEUE_WORKER_PORT) \
-		> /tmp/aegra-enqueue-worker.log 2>&1 & server_pid=$$!; \
+		> /tmp/aegra-enqueue-api.log 2>&1 & api_pid=$$!; \
 	for i in $$(seq 1 45); do \
 		curl -sf http://127.0.0.1:$(ENQUEUE_WORKER_PORT)/health > /dev/null 2>&1 && break; \
 		sleep 2; \
 	done; \
 	curl -sf http://127.0.0.1:$(ENQUEUE_WORKER_PORT)/health > /dev/null; \
+	WORKER_COUNT=2 SIDECAR_LIVE_PORT=8002 \
+		SERVER_URL=http://127.0.0.1:$(ENQUEUE_REMOTE_WORKER_PORT) \
+		.venv/bin/python -m uvicorn aegra_api.main:app \
+		--host 127.0.0.1 --port $(ENQUEUE_REMOTE_WORKER_PORT) \
+		> /tmp/aegra-enqueue-worker.log 2>&1 & worker_pid=$$!; \
+	for i in $$(seq 1 45); do \
+		curl -sf http://127.0.0.1:$(ENQUEUE_REMOTE_WORKER_PORT)/health > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done; \
+	curl -sf http://127.0.0.1:$(ENQUEUE_REMOTE_WORKER_PORT)/health > /dev/null; \
 	AEGRA_E2E_ENQUEUE=1 SERVER_URL=http://127.0.0.1:$(ENQUEUE_WORKER_PORT) \
 		.venv/bin/pytest $(ENQUEUE_TEST) -v --tb=short
 
