@@ -40,7 +40,8 @@ from aegra_api.services.run_executor import (
     _timeout_cancellations,
     execute_run,
 )
-from aegra_api.services.run_status import finalize_run
+from aegra_api.services.run_queue_signal import run_queue_signal
+from aegra_api.services.run_status import finalize_run, set_thread_status_if_no_active_runs
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -467,11 +468,13 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
             return None
 
         run_orm = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))
-        await session.commit()
+        if run_orm is None:
+            await session.rollback()
+            return None
 
-        if run_orm is None or run_orm.execution_params is None:
+        if run_orm.execution_params is None:
             logger.warning(
-                "Run not found or missing execution_params after lease, releasing claim",
+                "Run missing execution_params after lease, marking it terminal",
                 run_id=run_id,
                 worker=worker_name,
             )
@@ -485,11 +488,19 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
                     error_message="Run missing execution_params (data corruption or pre-migration row)",
                 )
             )
+            await set_thread_status_if_no_active_runs(
+                session,
+                [run_orm.thread_id],
+                "error",
+                user_id=run_orm.user_id,
+            )
             await session.commit()
+            run_queue_signal.notify()
             return None
 
         job = RunJob.from_run_orm(run_orm)
         trace = run_orm.execution_params.get("trace", {})
+        await session.commit()
         return _LoadedRun(job=job, trace=trace)
 
 
@@ -503,8 +514,8 @@ async def _push_back(run_id: str) -> None:
         logger.warning("Could not push back dequeued run at shutdown", run_id=run_id)
 
 
-async def _requeue_drained_runs(run_ids: list[str]) -> None:
-    """Hand runs cancelled at the drain deadline back to the queue.
+async def _reset_drained_runs(run_ids: list[str]) -> list[str]:
+    """Reset shutdown-cancelled runs to durable pending rows.
 
     Rows still 'running' were mid-execution with finalize skipped; rows still
     'pending' were dequeued but never claimed. Both must reach another instance.
@@ -519,6 +530,12 @@ async def _requeue_drained_runs(run_ids: list[str]) -> None:
         )
         reset_ids = [row[0] for row in result.fetchall()]
         await session.commit()
+    return reset_ids
+
+
+async def _requeue_drained_runs(run_ids: list[str]) -> None:
+    """Reset drained rows, then deliver them to Redis worker instances."""
+    reset_ids = await _reset_drained_runs(run_ids)
 
     if not reset_ids:
         return

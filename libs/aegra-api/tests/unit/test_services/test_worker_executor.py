@@ -22,6 +22,7 @@ from aegra_api.services.worker_executor import (
     _LoadedRun,
     _release_lease,
     _requeue_drained_runs,
+    _reset_drained_runs,
     _restore_trace_context,
 )
 
@@ -64,6 +65,7 @@ def _make_run_orm(
     orm.run_id = run_id
     orm.thread_id = thread_id
     orm.status = status
+    orm.user_id = "test-user"
     orm.execution_params = execution_params or {
         "graph_id": "test-graph",
         "user": {"identity": "test-user", "is_authenticated": True, "permissions": []},
@@ -200,10 +202,23 @@ class TestAcquireAndLoad:
                 f"{MODULE}.try_start_run",
                 AsyncMock(return_value=AdmissionOutcome.CLAIMED),
             ),
+            patch(
+                f"{MODULE}.set_thread_status_if_no_active_runs",
+                new_callable=AsyncMock,
+            ) as set_thread_status,
+            patch(f"{MODULE}.run_queue_signal.notify") as notify,
         ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
 
         assert result is None
+        set_thread_status.assert_awaited_once_with(
+            session,
+            ["11111111-2222-3333-4444-555555555555"],
+            "error",
+            user_id="test-user",
+        )
+        session.commit.assert_awaited_once()
+        notify.assert_called_once()
 
 
 # ------------------------------------------------------------------
@@ -1014,6 +1029,22 @@ class TestPostgresFallback:
 
 
 class TestRequeueDrainedRuns:
+    @pytest.mark.asyncio
+    async def test_reset_is_database_only(self) -> None:
+        session = AsyncMock()
+        result = MagicMock()
+        result.fetchall.return_value = [("run-1",)]
+        session.execute = AsyncMock(return_value=result)
+
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=_make_session_maker(session)),
+            patch(f"{MODULE}.redis_manager.get_client", side_effect=AssertionError("Redis must not be used")),
+        ):
+            reset = await _reset_drained_runs(["run-1"])
+
+        assert reset == ["run-1"]
+        session.commit.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_resets_rows_and_pushes_to_queue(self) -> None:
         session = AsyncMock()

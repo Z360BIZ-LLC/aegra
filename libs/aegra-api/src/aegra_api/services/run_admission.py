@@ -36,6 +36,14 @@ _PROMOTABLE_CANDIDATES_SQL = text(
                OR candidate.created_at < :stuck_before
            )
            AND (
+               candidate.org_id IS NULL
+               OR NOT (
+                   candidate.org_id = ANY(
+                       CAST(:saturated_org_ids AS TEXT[])
+                   )
+               )
+           )
+           AND (
                candidate.multitask_strategy <> 'enqueue'
                OR NOT EXISTS (
                    SELECT 1
@@ -179,35 +187,31 @@ async def find_promotable_runs(
 
     active = await run_limits.active_counts_by_org(session) if settings.run_limits.enforcing else {}
     scan_multiplier = max(10, run_limits.max_limit())
-    scan_limit = batch_size * scan_multiplier
-    stuck_before = datetime.now(UTC) - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS)
+    saturated_org_ids = (
+        sorted(org_id for org_id, count in active.items() if count >= run_limits.limit_for(org_id))
+        if settings.run_limits.enforcing
+        else []
+    )
+    candidates = await session.execute(
+        _PROMOTABLE_CANDIDATES_SQL,
+        {
+            "stuck_before": datetime.now(UTC) - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS),
+            "saturated_org_ids": saturated_org_ids,
+            "scan_limit": batch_size * scan_multiplier,
+        },
+    )
 
-    # A fixed prefix can contain only candidates from orgs that are already at
-    # capacity, permanently hiding eligible work behind it. Widen the fair,
-    # deterministic prefix until the batch is filled or the query is exhausted.
-    while True:
-        candidates = await session.execute(
-            _PROMOTABLE_CANDIDATES_SQL,
-            {
-                "stuck_before": stuck_before,
-                "scan_limit": scan_limit,
-            },
-        )
-        rows = candidates.all()
-        promotable: list[str] = []
-        projected = dict(active)
-        for run_id, org_id in rows:
-            if len(promotable) >= batch_size:
-                return promotable
-            if settings.run_limits.enforcing and org_id is not None:
-                if projected.get(org_id, 0) >= run_limits.limit_for(org_id):
-                    continue
-                projected[org_id] = projected.get(org_id, 0) + 1
-            promotable.append(run_id)
-
-        if len(rows) < scan_limit:
-            return promotable
-        scan_limit *= 2
+    promotable: list[str] = []
+    projected = dict(active)
+    for run_id, org_id in candidates.all():
+        if len(promotable) >= batch_size:
+            break
+        if settings.run_limits.enforcing and org_id is not None:
+            if projected.get(org_id, 0) >= run_limits.limit_for(org_id):
+                continue
+            projected[org_id] = projected.get(org_id, 0) + 1
+        promotable.append(run_id)
+    return promotable
 
 
 async def _load_state(session: AsyncSession, run_id: str) -> _AdmissionState | None:

@@ -235,15 +235,20 @@ class TestLocalExecutor:
         active_runs["run-hang"] = task
         executor._job_tasks["run-hang"] = task
 
-        with patch(
-            "aegra_api.services.local_executor._requeue_drained_runs",
-            new_callable=AsyncMock,
-        ) as requeue:
+        with (
+            patch(
+                "aegra_api.services.local_executor._reset_drained_runs",
+                new_callable=AsyncMock,
+                return_value=["run-hang"],
+            ) as reset,
+            patch("aegra_api.services.local_executor.run_queue_signal.notify") as notify,
+        ):
             await executor.stop()
         # Give event loop a tick to process cancellation
         await asyncio.sleep(0.01)
         assert task.done()
-        requeue.assert_awaited_once_with(["run-hang"])
+        reset.assert_awaited_once_with(["run-hang"])
+        notify.assert_called_once()
         active_runs.pop("run-hang", None)
 
 

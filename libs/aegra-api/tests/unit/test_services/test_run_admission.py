@@ -251,17 +251,13 @@ class TestPredecessorQuery:
 
 
 class TestFindPromotableRuns:
-    async def test_widens_scan_past_full_org_candidates(
+    async def test_excludes_saturated_orgs_inside_bounded_scan(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "enforce")
         monkeypatch.setattr(settings.run_limits, "ORG_MAX_CONCURRENT_RUNS", 1)
-        blocked = [(f"full-{index}", ORG) for index in range(10)]
-        session = _session(
-            _result(rows=blocked),
-            _result(rows=[*blocked, ("eligible", "org-2")]),
-        )
+        session = _session(_result(rows=[("eligible", "org-2")]))
         monkeypatch.setattr(
             run_admission.run_limits,
             "active_counts_by_org",
@@ -271,7 +267,11 @@ class TestFindPromotableRuns:
         result = await run_admission.find_promotable_runs(session, batch_size=1)
 
         assert result == ["eligible"]
-        assert [call.args[1]["scan_limit"] for call in session.execute.await_args_list] == [10, 20]
+        session.execute.assert_awaited_once()
+        params = session.execute.await_args.args[1]
+        assert params["saturated_org_ids"] == [ORG]
+        assert params["scan_limit"] == 10
+        assert "saturated_org_ids" in str(session.execute.await_args.args[0])
 
     async def test_selects_enqueue_thread_heads_and_non_enqueue_runs(
         self,

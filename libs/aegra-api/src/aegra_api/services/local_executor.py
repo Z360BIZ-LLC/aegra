@@ -19,6 +19,7 @@ from aegra_api.observability.span_enrichment import make_run_trace_context
 from aegra_api.services.base_executor import BaseExecutor
 from aegra_api.services.run_admission import AdmissionOutcome, try_start_run
 from aegra_api.services.run_executor import _shutdown_cancellations
+from aegra_api.services.run_queue_signal import run_queue_signal
 
 # Lease bookkeeping is identical for both executors; sharing it keeps a local
 # run's liveness signal in the same shape the reaper and the run-limit count
@@ -28,7 +29,7 @@ from aegra_api.services.worker_executor import (
     _heartbeat_loop,
     _is_run_terminal,
     _release_lease,
-    _requeue_drained_runs,
+    _reset_drained_runs,
 )
 from aegra_api.settings import settings
 
@@ -154,7 +155,11 @@ class LocalExecutor(BaseExecutor):
             await asyncio.gather(*self._lease_tasks, return_exceptions=True)
 
         if drained:
-            await _requeue_drained_runs(drained)
+            reset_ids = await _reset_drained_runs(drained)
+            if reset_ids:
+                # Local mode has no Redis transport. PostgreSQL is the queue of
+                # record and the promoter immediately rediscovers these rows.
+                run_queue_signal.notify()
             _shutdown_cancellations.difference_update(drained)
         self._job_tasks.clear()
         self._lease_tasks.clear()
