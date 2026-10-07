@@ -21,6 +21,7 @@ async def test_concurrent_auto_create_does_not_cross_user_thread_ownership() -> 
     engine = create_async_engine(settings.db.database_url)
     thread_id = f"ownership-race-{uuid4()}"
     release_first = asyncio.Event()
+    thread_table: str | None = None
 
     try:
         try:
