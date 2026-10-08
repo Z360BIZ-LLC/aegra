@@ -6,13 +6,10 @@ import pytest
 
 from aegra_api.services import run_limits
 from aegra_api.services.run_limits import (
-    ClaimOutcome,
     LimitDecision,
-    find_promotable_runs,
     limit_for,
     max_limit,
     resolve_org_id,
-    try_start_run,
 )
 from aegra_api.settings import settings
 
@@ -106,122 +103,6 @@ class TestLimitDecision:
         assert not LimitDecision(org_id=ORG, active=1, limit=2).at_capacity
 
 
-class TestTryStartRun:
-    async def test_claims_with_a_single_update_when_limits_are_off(self) -> None:
-        """The default path must not pay for a capacity lookup."""
-        session = _session(execute=[_result(rowcount=1)])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.CLAIMED
-        assert session.execute.await_count == 1
-
-    async def test_returns_already_taken_when_update_matches_nothing(self) -> None:
-        session = _session(execute=[_result(rowcount=0)])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.ALREADY_TAKEN
-
-    async def test_claims_when_org_has_free_capacity(self, limits: None) -> None:
-        session = _session(
-            execute=[_result(first=(ORG, "pending", None)), _result(), _result(rowcount=1)],
-            scalar=1,
-        )
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.CLAIMED
-
-    async def test_returns_at_capacity_when_org_is_full(self, limits: None) -> None:
-        session = _session(execute=[_result(first=(ORG, "pending", None)), _result()], scalar=2)
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.AT_CAPACITY
-
-    async def test_full_org_still_claims_in_shadow_mode(self, monkeypatch: pytest.MonkeyPatch, limits: None) -> None:
-        monkeypatch.setattr(settings.run_limits, "ORG_RUN_LIMIT_MODE", "shadow")
-        session = _session(
-            execute=[_result(first=(ORG, "pending", None)), _result(), _result(rowcount=1)],
-            scalar=99,
-        )
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.CLAIMED
-
-    async def test_run_without_org_is_exempt(self, limits: None) -> None:
-        """A run with no tenant is never gated, and never takes an org lock."""
-        session = _session(execute=[_result(first=(None, "pending", None)), _result(rowcount=1)])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.CLAIMED
-
-    async def test_returns_already_taken_when_run_is_gone(self, limits: None) -> None:
-        session = _session(execute=[_result(first=None)])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.ALREADY_TAKEN
-
-    async def test_returns_already_taken_when_run_is_no_longer_pending(self, limits: None) -> None:
-        session = _session(execute=[_result(first=(ORG, "running", "worker-1"))])
-
-        assert await try_start_run(session, "run-1") is ClaimOutcome.ALREADY_TAKEN
-
-
-class TestFindPromotableRuns:
-    async def test_skips_orgs_that_are_at_capacity(self, limits: None) -> None:
-        session = _session(
-            execute=[
-                _result(rows=[("full-org", 2), ("free-org", 1)]),
-                _result(rows=[("run-full", "full-org"), ("run-free", "free-org")]),
-                _result(rows=[]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=10) == ["run-free"]
-
-    async def test_counts_promotions_against_remaining_capacity(self, limits: None) -> None:
-        """Two free slots means two runs promoted, not the whole backlog."""
-        session = _session(
-            execute=[
-                _result(rows=[]),
-                _result(rows=[("run-1", ORG), ("run-2", ORG), ("run-3", ORG)]),
-                _result(rows=[]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=10) == ["run-1", "run-2"]
-
-    async def test_stops_at_batch_size(self, monkeypatch: pytest.MonkeyPatch, limits: None) -> None:
-        monkeypatch.setattr(settings.run_limits, "ORG_MAX_CONCURRENT_RUNS", 50)
-        session = _session(
-            execute=[
-                _result(rows=[]),
-                _result(rows=[("run-1", ORG), ("run-2", ORG), ("run-3", ORG)]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=2) == ["run-1", "run-2"]
-
-    async def test_returns_empty_when_nothing_is_queued(self, limits: None) -> None:
-        session = _session(execute=[_result(rows=[]), _result(rows=[]), _result(rows=[])])
-
-        assert await find_promotable_runs(session, batch_size=10) == []
-
-    async def test_recovers_long_pending_runs_that_have_no_org(self, limits: None) -> None:
-        """Exempt runs are never gated, so the promoter is their only safety net."""
-        session = _session(
-            execute=[
-                _result(rows=[]),
-                _result(rows=[]),
-                _result(rows=[("run-orphan",)]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=10) == ["run-orphan"]
-
-    async def test_org_less_recovery_does_not_exceed_batch_size(self, limits: None) -> None:
-        """A full batch of org-scoped runs leaves no room for the orphan sweep."""
-        session = _session(
-            execute=[
-                _result(rows=[]),
-                _result(rows=[("run-1", ORG), ("run-2", ORG)]),
-            ]
-        )
-
-        assert await find_promotable_runs(session, batch_size=2) == ["run-1", "run-2"]
-
-
 class TestStaleRunsAreNotCounted:
     async def test_count_query_excludes_expired_leases_and_old_rows(self, limits: None) -> None:
         """The count must filter on lease expiry and age, not just status."""
@@ -232,3 +113,33 @@ class TestStaleRunsAreNotCounted:
         rendered = str(session.scalar.await_args.args[0])
         assert "lease_expires_at" in rendered
         assert "created_at" in rendered
+
+
+class TestQueueExpiry:
+    async def test_only_org_blocked_runs_expire_from_reason_timestamp(
+        self,
+        limits: None,
+    ) -> None:
+        session = _session(execute=[_result(rows=[])])
+
+        await run_limits.find_expired_queued_runs(session, batch_size=10)
+
+        statement = str(session.execute.await_args.args[0])
+        assert "pending_reason" in statement
+        assert "pending_reason_at" in statement
+        assert "created_at" not in statement
+
+    async def test_expiry_claim_is_guarded_by_org_reason(
+        self,
+        limits: None,
+    ) -> None:
+        session = _session(execute=[_result(rowcount=1)])
+
+        assert await run_limits.claim_expired_run(
+            session,
+            "run-1",
+            error="expired",
+        )
+
+        statement = str(session.execute.await_args.args[0])
+        assert "pending_reason" in statement

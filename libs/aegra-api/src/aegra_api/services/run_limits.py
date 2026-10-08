@@ -7,8 +7,8 @@ them.
 
 The gate lives on the ``pending -> running`` transition, which is the only
 place a run starts consuming capacity. Both executors route their claim
-through :func:`try_start_run`, so the policy holds in Redis worker mode and
-in-process dev mode alike.
+through :mod:`aegra_api.services.run_admission`, so the policy holds in Redis
+worker mode and in-process dev mode alike.
 
 Counting is derived from the runs table rather than an incrementing counter:
 a crashed worker's lease expires and the reaper resets its row, so a derived
@@ -18,14 +18,11 @@ Dependency-light on purpose (orm + settings + metrics only) so it can be
 imported from executors and API code without an import cycle.
 """
 
-import enum
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import structlog
-from observability.cloudwatch_emf import emit_metric
 from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
@@ -33,20 +30,9 @@ from sqlalchemy.sql.elements import ColumnElement
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.settings import settings
 
-logger = structlog.getLogger(__name__)
-
 # Two-argument advisory locks occupy a namespace of their own, so this can
 # never collide with the single-argument lock state_backfill takes.
 _ADVISORY_LOCK_NAMESPACE = 8471
-
-
-class ClaimOutcome(enum.Enum):
-    """Result of attempting to move a run from ``pending`` to ``running``."""
-
-    CLAIMED = "claimed"
-    # Another worker got there first, or the run is gone / no longer pending.
-    ALREADY_TAKEN = "already_taken"
-    AT_CAPACITY = "at_capacity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,95 +158,6 @@ async def evaluate(session: AsyncSession, org_id: str) -> LimitDecision:
     return LimitDecision(org_id=org_id, active=active, limit=limit_for(org_id))
 
 
-async def try_start_run(
-    session: AsyncSession,
-    run_id: str,
-    *,
-    claimed_by: str | None = None,
-    lease_expires_at: datetime | None = None,
-) -> ClaimOutcome:
-    """Atomically move a run from ``pending`` to ``running`` if capacity allows.
-
-    Does NOT commit — the caller owns the transaction boundary, and the org
-    advisory lock must stay held until it closes.
-
-    ``AT_CAPACITY`` means the run is still valid and still queued; the caller
-    should leave it ``pending`` for the promoter rather than re-enqueueing it.
-
-    With limits off this is exactly the single atomic UPDATE it has always
-    been — the gate adds no round-trip to the default path.
-    """
-    if settings.run_limits.enabled:
-        gated = await _apply_capacity_gate(session, run_id)
-        if gated is not None:
-            return gated
-
-    result = await session.execute(
-        update(RunORM)
-        .where(RunORM.run_id == run_id, RunORM.status == "pending", RunORM.claimed_by.is_(None))
-        .values(claimed_by=claimed_by, lease_expires_at=lease_expires_at, status="running")
-    )
-    if result.rowcount == 0:  # type: ignore[union-attr]
-        return ClaimOutcome.ALREADY_TAKEN
-    return ClaimOutcome.CLAIMED
-
-
-async def _apply_capacity_gate(session: AsyncSession, run_id: str) -> ClaimOutcome | None:
-    """Return a terminal outcome when the claim must not proceed.
-
-    None means "carry on and attempt the claim". In shadow mode a full org
-    still proceeds, but emits the metric that would have gated it.
-    """
-    row = (
-        await session.execute(select(RunORM.org_id, RunORM.status, RunORM.claimed_by).where(RunORM.run_id == run_id))
-    ).first()
-    if row is None:
-        return ClaimOutcome.ALREADY_TAKEN
-
-    org_id, status, existing_claim = row
-    if status != "pending" or existing_claim is not None:
-        return ClaimOutcome.ALREADY_TAKEN
-    if org_id is None:
-        return None
-
-    await lock_org(session, org_id)
-    decision = await evaluate(session, org_id)
-    if not decision.at_capacity:
-        return None
-
-    if not settings.run_limits.enforcing:
-        emit_metric(
-            "OrgRunWouldQueue",
-            1,
-            properties={
-                "run_id": run_id,
-                "org_id": org_id,
-                "active": decision.active,
-                "limit": decision.limit,
-            },
-        )
-        return None
-
-    logger.info(
-        "Run held at org concurrency limit",
-        run_id=run_id,
-        org_id=org_id,
-        active=decision.active,
-        limit=decision.limit,
-    )
-    emit_metric(
-        "OrgRunQueued",
-        1,
-        properties={
-            "run_id": run_id,
-            "org_id": org_id,
-            "active": decision.active,
-            "limit": decision.limit,
-        },
-    )
-    return ClaimOutcome.AT_CAPACITY
-
-
 async def active_counts_by_org(session: AsyncSession) -> dict[str, int]:
     """Return per-org active run counts in one pass, for the promoter."""
     stmt = (
@@ -276,86 +173,6 @@ async def active_counts_by_org(session: AsyncSession) -> dict[str, int]:
     return {org_id: count for org_id, count in result.all() if org_id is not None}
 
 
-# Ordering by rank-then-age hands every org its oldest queued run before any
-# org gets a second, so a large backlog cannot crowd the scan window.
-_PROMOTABLE_CANDIDATES_SQL = text(
-    """
-    SELECT run_id, org_id
-      FROM (
-           SELECT run_id,
-                  org_id,
-                  created_at,
-                  row_number() OVER (PARTITION BY org_id ORDER BY created_at) AS rank
-             FROM runs
-            WHERE status = 'pending'
-              AND claimed_by IS NULL
-              AND org_id IS NOT NULL
-           ) ranked
-     WHERE rank <= :max_per_org
-     ORDER BY rank, created_at
-     LIMIT :scan_limit
-    """
-)
-
-
-# Runs with no tenant are exempt from limits, so they never appear above — but
-# the promoter replaces the reaper's stuck-pending sweep while enforcing, and
-# without this they would have no recovery path at all if their queue entry is
-# lost (Redis restart, or a crash between the run's commit and its enqueue).
-# Age-gated so freshly enqueued runs aren't pushed twice.
-_STUCK_UNSCOPED_CANDIDATES_SQL = text(
-    """
-    SELECT run_id
-      FROM runs
-     WHERE status = 'pending'
-       AND claimed_by IS NULL
-       AND org_id IS NULL
-       AND created_at < :stuck_before
-     ORDER BY created_at
-     LIMIT :scan_limit
-    """
-)
-
-
-async def find_promotable_runs(session: AsyncSession, *, batch_size: int) -> list[str]:
-    """Return queued run_ids that are safe to dispatch, fairest-first.
-
-    Purely advisory: the promoter re-enqueues these, and the claim re-checks
-    capacity under the org lock, so an over-selection here is harmless.
-    """
-    active = await active_counts_by_org(session)
-    candidates = await session.execute(
-        _PROMOTABLE_CANDIDATES_SQL,
-        {"max_per_org": max_limit(), "scan_limit": batch_size * 10},
-    )
-
-    promotable: list[str] = []
-    projected = dict(active)
-    for run_id, org_id in candidates.all():
-        if len(promotable) >= batch_size:
-            break
-        if projected.get(org_id, 0) >= limit_for(org_id):
-            continue
-        projected[org_id] = projected.get(org_id, 0) + 1
-        promotable.append(run_id)
-
-    remaining = batch_size - len(promotable)
-    if remaining > 0:
-        promotable.extend(await _find_stuck_unscoped_runs(session, batch_size=remaining))
-
-    return promotable
-
-
-async def _find_stuck_unscoped_runs(session: AsyncSession, *, batch_size: int) -> list[str]:
-    """Return long-pending runs that carry no tenant and so are never gated."""
-    stuck_before = datetime.now(UTC) - timedelta(seconds=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS)
-    result = await session.execute(
-        _STUCK_UNSCOPED_CANDIDATES_SQL,
-        {"stuck_before": stuck_before, "scan_limit": batch_size},
-    )
-    return [row[0] for row in result.all()]
-
-
 @dataclass(frozen=True, slots=True)
 class ExpiredRun:
     """A queued run that waited too long, detached from its session.
@@ -367,6 +184,7 @@ class ExpiredRun:
 
     run_id: str
     thread_id: str
+    user_id: str
     org_id: str | None
     webhook_url: str | None
 
@@ -383,14 +201,20 @@ async def find_expired_queued_runs(session: AsyncSession, *, batch_size: int) ->
     """
     cutoff = datetime.now(UTC) - timedelta(seconds=settings.run_limits.ORG_RUN_MAX_QUEUE_WAIT_SECONDS)
     stmt = (
-        select(RunORM.run_id, RunORM.thread_id, RunORM.org_id, RunORM.execution_params)
+        select(
+            RunORM.run_id,
+            RunORM.thread_id,
+            RunORM.user_id,
+            RunORM.org_id,
+            RunORM.execution_params,
+        )
         .where(
             RunORM.status == "pending",
             RunORM.claimed_by.is_(None),
-            RunORM.org_id.isnot(None),
-            RunORM.created_at < cutoff,
+            RunORM.pending_reason == "org",
+            RunORM.pending_reason_at < cutoff,
         )
-        .order_by(RunORM.created_at.asc())
+        .order_by(RunORM.pending_reason_at.asc())
         .limit(batch_size)
     )
     result = await session.execute(stmt)
@@ -398,10 +222,11 @@ async def find_expired_queued_runs(session: AsyncSession, *, batch_size: int) ->
         ExpiredRun(
             run_id=run_id,
             thread_id=thread_id,
+            user_id=user_id,
             org_id=org_id,
             webhook_url=_webhook_url_from(execution_params),
         )
-        for run_id, thread_id, org_id, execution_params in result.all()
+        for run_id, thread_id, user_id, org_id, execution_params in result.all()
     ]
 
 
@@ -428,6 +253,7 @@ async def claim_expired_run(session: AsyncSession, run_id: str, *, error: str) -
             RunORM.run_id == run_id,
             RunORM.status == "pending",
             RunORM.claimed_by.is_(None),
+            RunORM.pending_reason == "org",
         )
         .values(status="error", error_message=error, updated_at=datetime.now(UTC))
     )

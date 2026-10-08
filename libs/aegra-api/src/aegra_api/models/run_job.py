@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from aegra_api.models.auth import User
+from aegra_api.models.runs import MultitaskStrategy
 
 if TYPE_CHECKING:
     from aegra_api.core.orm import Run as RunORM
@@ -52,9 +53,15 @@ class RunBehavior(BaseModel):
 
     interrupt_before: str | list[str] | None = None
     interrupt_after: str | list[str] | None = None
-    multitask_strategy: str | None = None
+    multitask_strategy: MultitaskStrategy = "enqueue"
     subgraphs: bool = False
     webhook_url: str | None = None
+
+    @field_validator("multitask_strategy", mode="before")
+    @classmethod
+    def default_multitask_strategy(cls, value: object) -> object:
+        """Normalize the SDK's explicit null to the platform default."""
+        return "enqueue" if value is None else value
 
 
 class RunJob(BaseModel):
@@ -95,6 +102,10 @@ class RunJob(BaseModel):
         params = run_orm.execution_params
         if params is None:
             raise ValueError(f"Run {run_orm.run_id} has no execution_params")
+        behavior = dict(params.get("behavior") or {})
+        if behavior.get("multitask_strategy") is None:
+            persisted = getattr(run_orm, "multitask_strategy", None)
+            behavior["multitask_strategy"] = persisted if isinstance(persisted, str) else "enqueue"
         return cls(
             identity=RunIdentity(
                 run_id=run_orm.run_id,
@@ -103,6 +114,6 @@ class RunJob(BaseModel):
             ),
             user=User.model_validate(params["user"]),
             execution=RunExecution.model_validate(params["execution"]),
-            behavior=RunBehavior.model_validate(params["behavior"]),
+            behavior=RunBehavior.model_validate(behavior),
             run_metadata=params.get("run_metadata") or {},
         )

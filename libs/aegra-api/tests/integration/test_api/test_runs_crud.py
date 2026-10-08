@@ -1,6 +1,11 @@
 """Integration tests for runs CRUD operations"""
 
+from collections.abc import AsyncGenerator
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from starlette.responses import Response
 
 from tests.fixtures.clients import create_test_app, make_client
 from tests.fixtures.database import DummySessionBase
@@ -108,6 +113,43 @@ def _make_session_maker(session_instance: DummySessionBase) -> MagicMock:
     ctx.__aenter__ = AsyncMock(return_value=session_instance)
     ctx.__aexit__ = AsyncMock(return_value=False)
     return MagicMock(return_value=ctx)
+
+
+async def _empty_json_body() -> AsyncGenerator[bytes, None]:
+    yield b"{}"
+
+
+def _strategy_session() -> tuple[type[DummySessionBase], MagicMock]:
+    assistant = _assistant_row()
+
+    class Session(DummySessionBase):
+        persisted = None
+
+        async def scalar(self, stmt):
+            stmt_text = str(stmt).lower()
+            if "from assistant" in stmt_text:
+                return assistant
+            if "from run" in stmt_text:
+                return type(self).persisted
+            return None
+
+        async def execute(self, stmt, params=None):
+            class Result:
+                rowcount = 1
+
+            return Result()
+
+        def add(self, obj):
+            type(self).persisted = obj
+
+        async def commit(self):
+            pass
+
+        async def refresh(self, obj):
+            pass
+
+    session = Session()
+    return Session, _make_session_maker(session)
 
 
 class TestCreateRun:
@@ -759,6 +801,103 @@ class TestCreateRunValidation:
         # Validation conflict is removed; request proceeds to assistant lookup
         assert resp.status_code == 404
 
+
+class TestMultitaskStrategyContract:
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/threads/test-thread-123/runs",
+            "/threads/test-thread-123/runs/stream",
+            "/threads/test-thread-123/runs/wait",
+        ],
+    )
+    def test_invalid_strategy_is_rejected_before_scheduling(
+        self,
+        endpoint: str,
+    ) -> None:
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        response = client.post(
+            endpoint,
+            json={
+                "assistant_id": "test-assistant-123",
+                "input": {"message": "test"},
+                "multitask_strategy": "parallel",
+            },
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.parametrize(
+        ("endpoint", "strategy"),
+        [
+            ("/threads/test-thread-123/runs", None),
+            ("/threads/test-thread-123/runs", "enqueue"),
+            ("/threads/test-thread-123/runs/stream", None),
+            ("/threads/test-thread-123/runs/stream", "enqueue"),
+            ("/threads/test-thread-123/runs/wait", None),
+            ("/threads/test-thread-123/runs/wait", "enqueue"),
+        ],
+    )
+    def test_enqueue_reaches_persisted_run_and_execution_params(
+        self,
+        endpoint: str,
+        strategy: str | None,
+    ) -> None:
+        app = create_test_app(include_runs=True, include_threads=False)
+        session_type, maker = _strategy_session()
+        override_session_dependency(app, session_type)
+        client = make_client(app)
+        body: dict[str, object] = {
+            "assistant_id": "test-assistant-123",
+            "input": {"message": "test"},
+        }
+        if strategy is not None:
+            body["multitask_strategy"] = strategy
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("aegra_api.api.runs._get_session_maker", return_value=maker))
+            stack.enter_context(
+                patch(
+                    "aegra_api.services.run_preparation.lock_thread",
+                    new_callable=AsyncMock,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "aegra_api.services.run_preparation.executor.submit",
+                    new_callable=AsyncMock,
+                )
+            )
+            graph_service = stack.enter_context(patch("aegra_api.services.run_preparation.get_langgraph_service"))
+            graph_service.return_value.list_graphs.return_value = ["test-graph"]
+            if endpoint.endswith("/stream"):
+                stack.enter_context(
+                    patch(
+                        "aegra_api.api.runs.make_sse_response",
+                        return_value=Response(status_code=200),
+                    )
+                )
+            if endpoint.endswith("/wait"):
+                stack.enter_context(
+                    patch(
+                        "aegra_api.api.runs.heartbeat_wait_body",
+                        return_value=_empty_json_body(),
+                    )
+                )
+
+            response = client.post(endpoint, json=body)
+
+        assert response.status_code == 200
+        persisted = session_type.persisted
+        assert persisted is not None
+        assert persisted.multitask_strategy == "enqueue"
+        assert persisted.execution_params["behavior"]["multitask_strategy"] == "enqueue"
+        if endpoint.endswith("/runs"):
+            assert response.json()["multitask_strategy"] == "enqueue"
+
     def test_create_run_assistant_not_found(self):
         """Test create_run with non-existent assistant."""
         app = create_test_app(include_runs=True, include_threads=False)
@@ -819,7 +958,7 @@ class TestWaitForRunTimeouts:
             async def commit(self):
                 pass
 
-            async def execute(self, stmt):
+            async def execute(self, stmt, params=None):
                 class Result:
                     rowcount = 1
 
@@ -839,6 +978,7 @@ class TestWaitForRunTimeouts:
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters.executor", mock_executor),
+            patch("aegra_api.services.run_preparation.executor", mock_executor),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_service,
         ):
             mock_service.return_value.list_graphs.return_value = ["test-graph"]

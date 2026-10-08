@@ -82,6 +82,8 @@ async def test_lifespan_calls_required_initialization():
         patch("aegra_api.main.start_sidecar"),
         patch("aegra_api.main.LoopHeartbeat"),
         patch("aegra_api.main.heartbeat_task", new_callable=AsyncMock),
+        patch("aegra_api.main.lease_reaper") as mock_reaper,
+        patch("aegra_api.main.run_promoter") as mock_promoter,
     ):
         # Setup mocks
         mock_db_manager.initialize = AsyncMock()
@@ -90,6 +92,10 @@ async def test_lifespan_calls_required_initialization():
         mock_langgraph_service = MagicMock()
         mock_langgraph_service.initialize = AsyncMock()
         mock_get_langgraph_service.return_value = mock_langgraph_service
+        mock_reaper.start = AsyncMock()
+        mock_reaper.stop = AsyncMock()
+        mock_promoter.start = AsyncMock()
+        mock_promoter.stop = AsyncMock()
 
         mock_app = MagicMock()
 
@@ -104,6 +110,10 @@ async def test_lifespan_calls_required_initialization():
 
         # Verify observability setup was called
         mock_setup_observability.assert_called_once()
+        mock_reaper.start.assert_awaited_once()
+        mock_reaper.stop.assert_awaited_once()
+        mock_promoter.start.assert_awaited_once()
+        mock_promoter.stop.assert_awaited_once()
 
         # Verify cleanup
         mock_db_manager.close.assert_called_once()

@@ -1,18 +1,16 @@
-"""Background loop that dispatches runs queued behind an org's run limit.
+"""Background loop that dispatches eligible durable queued runs.
 
-When a run is held at its organization's concurrency ceiling it stays
-``pending`` instead of being rejected. This loop watches for freed capacity
-and re-dispatches the oldest queued run for each org, so the queue drains as
-soon as an org "gets some breath".
+Thread- or organization-blocked runs stay ``pending`` instead of being lost.
+This loop wakes on local queue transitions and periodically scans PostgreSQL
+for eligible thread heads, including work whose transport delivery was lost.
 
 It also expires runs that have waited past
 ``ORG_RUN_MAX_QUEUE_WAIT_SECONDS``: starting one hours late would answer a
 conversation that has already moved on, so the run is failed and its webhook
 fires, handing the retry decision back to the caller.
 
-Replaces the lease reaper's stuck-pending sweep while limits are enforcing —
-that sweep re-enqueues any pending run older than a threshold with no
-capacity check, which would fight this loop.
+PostgreSQL eligibility is authoritative; dispatch is only a delivery hint and
+the executor admission gate rechecks every decision under advisory locks.
 """
 
 import asyncio
@@ -24,7 +22,9 @@ from observability.cloudwatch_emf import emit_metric
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.services import run_limits
 from aegra_api.services.executor import executor
-from aegra_api.services.run_status import set_thread_status
+from aegra_api.services.run_admission import find_promotable_runs
+from aegra_api.services.run_queue_signal import run_queue_signal
+from aegra_api.services.run_status import set_thread_status_if_no_active_runs
 from aegra_api.services.webhook_service import send_run_webhook
 from aegra_api.settings import settings
 
@@ -62,7 +62,13 @@ class RunPromoter:
     async def _loop(self) -> None:
         interval = settings.run_limits.ORG_RUN_PROMOTER_INTERVAL_SECONDS
         while self._running:
-            await asyncio.sleep(interval)
+            try:
+                await run_queue_signal.wait(interval)
+            except asyncio.CancelledError:
+                break
+            if not self._running:
+                break
+            run_queue_signal.clear()
             try:
                 await self.tick()
             except asyncio.CancelledError:
@@ -84,7 +90,7 @@ class RunPromoter:
         """Dispatch queued runs whose org now has a free slot."""
         maker = _get_session_maker()
         async with maker() as session:
-            run_ids = await run_limits.find_promotable_runs(
+            run_ids = await find_promotable_runs(
                 session,
                 batch_size=settings.run_limits.ORG_RUN_PROMOTER_BATCH_SIZE,
             )
@@ -129,8 +135,14 @@ class RunPromoter:
                 await session.rollback()
                 logger.debug("Overdue run already started or expired elsewhere", run_id=expired.run_id)
                 return
-            await set_thread_status(session, expired.thread_id, "error")
+            await set_thread_status_if_no_active_runs(
+                session,
+                [expired.thread_id],
+                "error",
+                user_id=expired.user_id,
+            )
             await session.commit()
+        run_queue_signal.notify()
 
         logger.warning(
             "Expired run that exceeded the maximum queue wait",

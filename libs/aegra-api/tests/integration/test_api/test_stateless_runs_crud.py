@@ -203,7 +203,7 @@ class TestStatelessWaitForRun:
             async def commit(self) -> None:
                 pass
 
-            async def execute(self, stmt: object) -> object:
+            async def execute(self, stmt: object, params: object | None = None) -> object:
                 class Result:
                     rowcount = 1
 
@@ -223,6 +223,7 @@ class TestStatelessWaitForRun:
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters.executor", mock_executor),
+            patch("aegra_api.services.run_preparation.executor", mock_executor),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_service,
             patch("aegra_api.api.stateless_runs.delete_thread_by_id", new_callable=AsyncMock),
         ):

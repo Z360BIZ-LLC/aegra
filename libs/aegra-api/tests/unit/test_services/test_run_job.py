@@ -47,8 +47,13 @@ class TestRunBehavior:
         behavior = RunBehavior()
         assert behavior.interrupt_before is None
         assert behavior.interrupt_after is None
-        assert behavior.multitask_strategy is None
+        assert behavior.multitask_strategy == "enqueue"
         assert behavior.subgraphs is False
+
+    def test_explicit_none_uses_enqueue_default(self) -> None:
+        behavior = RunBehavior(multitask_strategy=None)  # type: ignore[arg-type]
+
+        assert behavior.multitask_strategy == "enqueue"
 
 
 class TestRunJob:
@@ -171,3 +176,22 @@ class TestRunJob:
 
         restored = RunJob.from_run_orm(LegacyORM())
         assert restored.run_metadata == {}
+        assert restored.behavior.multitask_strategy == "enqueue"
+
+    def test_from_run_orm_uses_persisted_strategy_for_legacy_null_behavior(self) -> None:
+        """A dedicated column is authoritative for rows with legacy JSON."""
+
+        class LegacyORM:
+            run_id = "r1"
+            thread_id = "t1"
+            multitask_strategy = "rollback"
+            execution_params = {
+                "graph_id": "g1",
+                "user": {"identity": "u1", "is_authenticated": True, "permissions": []},
+                "execution": {},
+                "behavior": {"multitask_strategy": None},
+            }
+
+        restored = RunJob.from_run_orm(LegacyORM())
+
+        assert restored.behavior.multitask_strategy == "rollback"

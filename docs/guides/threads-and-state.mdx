@@ -53,6 +53,47 @@ print(thread["status"])  # "idle", "busy", "interrupted", "error"
   The snippets below assume you are inside an `async def` function with an initialized `client` — see the example above.
 </Note>
 
+## Concurrent runs and FIFO enqueue
+
+Stateful runs default to `multitask_strategy="enqueue"`. Aegra assigns every
+created run a durable PostgreSQL queue position and allows only the oldest
+pending or running enqueue run on a thread to execute. Later runs stay
+`pending`, then start in creation order after their predecessor reaches
+`success`, `error`, or `interrupted`. This prevents two runs from writing the
+same thread checkpoint concurrently and losing one update.
+
+The default is also used when `multitask_strategy` is omitted or sent as
+`null`. You can state it explicitly when creating a run:
+
+```python
+run = await client.runs.create(
+    thread_id,
+    "agent",
+    input={"messages": [{"role": "user", "content": "Hello"}]},
+    multitask_strategy="enqueue",
+)
+```
+
+FIFO admission applies only within one thread. Runs on different threads can
+execute concurrently, subject to any configured per-organization run limit.
+Queued runs survive process restarts and multi-replica hand-offs because
+PostgreSQL, not an in-memory lock or the Redis delivery list, is the source of
+truth. Cancellation or deletion of a queued run releases its successor.
+
+<Warning>
+  `reject`, `interrupt`, and `rollback` are accepted by the API for Agent
+  Protocol compatibility, but Aegra does not implement their scheduling
+  semantics yet. They must not be used as substitutes for `enqueue`.
+</Warning>
+
+### Explicit checkpoint runs
+
+If a queued run includes `checkpoint`, Aegra preserves that exact checkpoint
+selection while it waits. When admitted, the run branches from the requested
+checkpoint; it is not silently rebased onto state written by earlier queued
+runs. Runs without an explicit checkpoint naturally read the latest thread
+state when they begin.
+
 ## Getting thread state
 
 The state contains the current values of all state fields, information about what nodes will execute next, and any pending interrupts.

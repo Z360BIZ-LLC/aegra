@@ -20,7 +20,7 @@ import structlog
 from asgi_correlation_id import correlation_id
 from redis import RedisError
 from redis import TimeoutError as RedisTimeoutError
-from sqlalchemy import Select, select, update
+from sqlalchemy import select, update
 
 from aegra_api.core.active_runs import active_runs, explicit_run_cancellations
 from aegra_api.core.orm import Run as RunORM
@@ -28,15 +28,20 @@ from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
 from aegra_api.observability.span_enrichment import merge_run_metadata, set_trace_context
-from aegra_api.services import run_limits
 from aegra_api.services.base_executor import BaseExecutor
+from aegra_api.services.run_admission import (
+    AdmissionOutcome,
+    find_promotable_runs,
+    try_start_run,
+)
 from aegra_api.services.run_executor import (
     _lease_loss_cancellations,
     _shutdown_cancellations,
     _timeout_cancellations,
     execute_run,
 )
-from aegra_api.services.run_status import finalize_run
+from aegra_api.services.run_queue_signal import run_queue_signal
+from aegra_api.services.run_status import finalize_run, set_thread_status_if_no_active_runs
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -396,36 +401,16 @@ class WorkerExecutor(BaseExecutor):
 
     @staticmethod
     async def _poll_postgres() -> str | None:
-        """Pick the oldest pending, unclaimed run from Postgres.
-
-        Skips runs whose org is at its limit, otherwise this fallback would
-        return the same blocked run on every poll while Redis is down.
-        """
+        """Pick one thread- and org-eligible run from PostgreSQL."""
         maker = _get_session_maker()
         async with maker() as session:
-            if settings.run_limits.enforcing:
-                promotable = await run_limits.find_promotable_runs(session, batch_size=1)
-                if promotable:
-                    return promotable[0]
-                # Runs with no tenant are never gated, so pick them up
-                # immediately rather than waiting out the promoter's
-                # stuck-run threshold on this already-degraded path.
-                return await session.scalar(_oldest_pending_stmt(unscoped_only=True))
-
-            return await session.scalar(_oldest_pending_stmt(unscoped_only=False))
+            promotable = await find_promotable_runs(session, batch_size=1)
+            return promotable[0] if promotable else None
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
-
-
-def _oldest_pending_stmt(*, unscoped_only: bool) -> Select[tuple[str]]:
-    """Select the oldest unclaimed pending run, optionally only tenant-less ones."""
-    stmt = select(RunORM.run_id).where(RunORM.status == "pending", RunORM.claimed_by.is_(None))
-    if unscoped_only:
-        stmt = stmt.where(RunORM.org_id.is_(None))
-    return stmt.order_by(RunORM.created_at.asc()).limit(1)
 
 
 async def _get_run_identity(run_id: str) -> tuple[str, str] | None:
@@ -466,25 +451,30 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
     async with maker() as session:
         # try_start_run holds an org advisory lock for the rest of this
         # transaction, so the capacity check it made cannot go stale.
-        outcome = await run_limits.try_start_run(
+        outcome = await try_start_run(
             session,
             run_id,
             claimed_by=worker_name,
             lease_expires_at=lease_until,
         )
-        if outcome is not run_limits.ClaimOutcome.CLAIMED:
-            # AT_CAPACITY leaves the run pending on purpose — the promoter
-            # re-dispatches it when the org frees a slot. Re-enqueueing here
-            # would spin the worker on a run it cannot start.
+        if outcome is AdmissionOutcome.ALREADY_TAKEN:
             await session.rollback()
+            return None
+        if outcome in (
+            AdmissionOutcome.THREAD_BLOCKED,
+            AdmissionOutcome.ORG_AT_CAPACITY,
+        ):
+            await session.commit()
             return None
 
         run_orm = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))
-        await session.commit()
+        if run_orm is None:
+            await session.rollback()
+            return None
 
-        if run_orm is None or run_orm.execution_params is None:
+        if run_orm.execution_params is None:
             logger.warning(
-                "Run not found or missing execution_params after lease, releasing claim",
+                "Run missing execution_params after lease, marking it terminal",
                 run_id=run_id,
                 worker=worker_name,
             )
@@ -498,11 +488,19 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
                     error_message="Run missing execution_params (data corruption or pre-migration row)",
                 )
             )
+            await set_thread_status_if_no_active_runs(
+                session,
+                [run_orm.thread_id],
+                "error",
+                user_id=run_orm.user_id,
+            )
             await session.commit()
+            run_queue_signal.notify()
             return None
 
         job = RunJob.from_run_orm(run_orm)
         trace = run_orm.execution_params.get("trace", {})
+        await session.commit()
         return _LoadedRun(job=job, trace=trace)
 
 
@@ -516,8 +514,8 @@ async def _push_back(run_id: str) -> None:
         logger.warning("Could not push back dequeued run at shutdown", run_id=run_id)
 
 
-async def _requeue_drained_runs(run_ids: list[str]) -> None:
-    """Hand runs cancelled at the drain deadline back to the queue.
+async def _reset_drained_runs(run_ids: list[str]) -> list[str]:
+    """Reset shutdown-cancelled runs to durable pending rows.
 
     Rows still 'running' were mid-execution with finalize skipped; rows still
     'pending' were dequeued but never claimed. Both must reach another instance.
@@ -532,6 +530,12 @@ async def _requeue_drained_runs(run_ids: list[str]) -> None:
         )
         reset_ids = [row[0] for row in result.fetchall()]
         await session.commit()
+    return reset_ids
+
+
+async def _requeue_drained_runs(run_ids: list[str]) -> None:
+    """Reset drained rows, then deliver them to Redis worker instances."""
+    reset_ids = await _reset_drained_runs(run_ids)
 
     if not reset_ids:
         return

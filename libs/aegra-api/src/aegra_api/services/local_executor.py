@@ -11,20 +11,26 @@ import socket
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import select
 
 from aegra_api.core.active_runs import active_runs
-from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.models.run_job import RunJob
 from aegra_api.observability.span_enrichment import make_run_trace_context
-from aegra_api.services import run_limits
 from aegra_api.services.base_executor import BaseExecutor
+from aegra_api.services.run_admission import AdmissionOutcome, try_start_run
+from aegra_api.services.run_executor import _shutdown_cancellations
+from aegra_api.services.run_queue_signal import run_queue_signal
 
 # Lease bookkeeping is identical for both executors; sharing it keeps a local
 # run's liveness signal in the same shape the reaper and the run-limit count
 # already understand.
-from aegra_api.services.worker_executor import _heartbeat_loop, _release_lease
+from aegra_api.services.worker_executor import (
+    _acquire_and_load,
+    _heartbeat_loop,
+    _is_run_terminal,
+    _release_lease,
+    _reset_drained_runs,
+)
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -36,18 +42,15 @@ class LocalExecutor(BaseExecutor):
     def __init__(self) -> None:
         self._owner = f"local-{socket.gethostname()}-{os.getpid()}"
         self._lease_tasks: set[asyncio.Task[None]] = set()
+        self._job_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def submit(self, job: RunJob) -> None:
-        # With limits off the run starts immediately and execute_run performs
-        # the pending -> running transition, exactly as it always has.
-        if not settings.run_limits.enforcing:
-            self._spawn(job)
-            return
-
-        if not await self._claim(job.identity.run_id):
+        outcome = await self._claim(job.identity.run_id)
+        if outcome is not AdmissionOutcome.CLAIMED:
             logger.info(
-                "Run left queued behind org run limit",
+                "Run not admitted by local executor",
                 run_id=job.identity.run_id,
+                outcome=outcome.value,
             )
             return
 
@@ -55,12 +58,10 @@ class LocalExecutor(BaseExecutor):
 
     async def promote(self, run_id: str) -> None:
         """Start a queued run now that its org has a free slot."""
-        job = await self._load_job(run_id)
-        if job is None:
+        loaded = await _acquire_and_load(run_id, self._owner)
+        if loaded is None:
             return
-        if not await self._claim(run_id):
-            return
-        self._spawn(job)
+        self._spawn(loaded.job)
 
     def _spawn(self, job: RunJob) -> None:
         """Create the background task that executes the graph."""
@@ -77,10 +78,11 @@ class LocalExecutor(BaseExecutor):
         )
         task = asyncio.create_task(execute_run(job), context=trace_ctx)
         active_runs[job.identity.run_id] = task
-        if settings.run_limits.enforcing:
-            keeper = asyncio.create_task(self._keep_lease(job.identity.run_id, task))
-            self._lease_tasks.add(keeper)
-            keeper.add_done_callback(self._lease_tasks.discard)
+        self._job_tasks[job.identity.run_id] = task
+        task.add_done_callback(lambda completed, run_id=job.identity.run_id: self._job_tasks.pop(run_id, None))
+        keeper = asyncio.create_task(self._keep_lease(job.identity.run_id, task))
+        self._lease_tasks.add(keeper)
+        keeper.add_done_callback(self._lease_tasks.discard)
         logger.info(
             "Submitted run to local executor",
             run_id=job.identity.run_id,
@@ -103,49 +105,60 @@ class LocalExecutor(BaseExecutor):
                 await heartbeat
             await _release_lease(run_id, self._owner)
 
-    async def _claim(self, run_id: str) -> bool:
+    async def _claim(self, run_id: str) -> AdmissionOutcome:
         """Reserve a capacity slot for this run, committing the transition."""
         lease_until = datetime.now(UTC) + timedelta(seconds=settings.worker.LEASE_DURATION_SECONDS)
         maker = _get_session_maker()
         async with maker() as session:
-            outcome = await run_limits.try_start_run(
+            outcome = await try_start_run(
                 session,
                 run_id,
                 claimed_by=self._owner,
                 lease_expires_at=lease_until,
             )
-            if outcome is not run_limits.ClaimOutcome.CLAIMED:
+            if outcome is AdmissionOutcome.ALREADY_TAKEN:
                 await session.rollback()
-                return False
+                return outcome
             await session.commit()
-            return True
-
-    @staticmethod
-    async def _load_job(run_id: str) -> RunJob | None:
-        """Rebuild a RunJob from its persisted execution params."""
-        maker = _get_session_maker()
-        async with maker() as session:
-            run_orm = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))
-            if run_orm is None or run_orm.execution_params is None:
-                logger.warning("Cannot promote run without execution_params", run_id=run_id)
-                return None
-            return RunJob.from_run_orm(run_orm)
+            return outcome
 
     async def wait_for_completion(self, run_id: str, *, timeout: float = 300.0) -> None:
-        task = active_runs.get(run_id)
-        if task is None:
-            return
         with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            async with asyncio.timeout(timeout):
+                while True:
+                    task = active_runs.get(run_id)
+                    if task is not None:
+                        await asyncio.shield(task)
+                        return
+                    if await _is_run_terminal(run_id):
+                        return
+                    await asyncio.sleep(0.1)
 
     async def start(self) -> None:
         logger.info("Local executor started (in-process asyncio tasks)")
 
     async def stop(self) -> None:
-        tasks_to_cancel = [task for task in active_runs.values() if not task.done()]
-        for task in tasks_to_cancel:
-            task.cancel()
-        if tasks_to_cancel:
-            logger.info("Draining cancelled tasks", count=len(tasks_to_cancel))
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        drained = [run_id for run_id, task in self._job_tasks.items() if not task.done()]
+        if drained:
+            _shutdown_cancellations.update(drained)
+            logger.info("Handing off local runs at shutdown", count=len(drained))
+            for run_id in drained:
+                self._job_tasks[run_id].cancel()
+            await asyncio.gather(
+                *(self._job_tasks[run_id] for run_id in drained),
+                return_exceptions=True,
+            )
+
+        if self._lease_tasks:
+            await asyncio.gather(*self._lease_tasks, return_exceptions=True)
+
+        if drained:
+            reset_ids = await _reset_drained_runs(drained)
+            if reset_ids:
+                # Local mode has no Redis transport. PostgreSQL is the queue of
+                # record and the promoter immediately rediscovers these rows.
+                run_queue_signal.notify()
+            _shutdown_cancellations.difference_update(drained)
+        self._job_tasks.clear()
+        self._lease_tasks.clear()
         logger.info("Local executor stopped")

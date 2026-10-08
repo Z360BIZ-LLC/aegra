@@ -451,7 +451,10 @@ class TestCleanupAfterBackgroundRun:
         await task  # let it finish before test to avoid timing issues
 
         with (
-            patch("aegra_api.services.run_cleanup.active_runs", {run_id: task}),
+            patch(
+                "aegra_api.services.run_cleanup.executor.wait_for_completion",
+                new_callable=AsyncMock,
+            ) as mock_wait,
             patch(
                 "aegra_api.services.run_cleanup.delete_thread_by_id",
                 new_callable=AsyncMock,
@@ -460,6 +463,7 @@ class TestCleanupAfterBackgroundRun:
             await _cleanup_after_background_run(run_id, thread_id, user_id)
 
         assert task_awaited
+        mock_wait.assert_awaited_once_with(run_id, timeout=3600.0)
         mock_delete.assert_called_once_with(thread_id, user_id)
 
     @pytest.mark.asyncio
@@ -470,7 +474,10 @@ class TestCleanupAfterBackgroundRun:
         user_id = "test-user"
 
         with (
-            patch("aegra_api.services.run_cleanup.active_runs", {}),
+            patch(
+                "aegra_api.services.run_cleanup.executor.wait_for_completion",
+                new_callable=AsyncMock,
+            ),
             patch(
                 "aegra_api.services.run_cleanup.delete_thread_by_id",
                 new_callable=AsyncMock,
@@ -493,7 +500,10 @@ class TestCleanupAfterBackgroundRun:
         user_id = "test-user"
 
         with (
-            patch("aegra_api.services.run_cleanup.active_runs", {}),
+            patch(
+                "aegra_api.services.run_cleanup.executor.wait_for_completion",
+                new_callable=AsyncMock,
+            ),
             patch(
                 "aegra_api.services.run_cleanup.delete_thread_by_id",
                 new_callable=AsyncMock,

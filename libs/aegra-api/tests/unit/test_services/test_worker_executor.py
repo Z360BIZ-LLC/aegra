@@ -11,7 +11,7 @@ from redis import TimeoutError as RedisTimeoutError
 from aegra_api.core.active_runs import active_runs, explicit_run_cancellations
 from aegra_api.models.auth import User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
-from aegra_api.services import run_limits
+from aegra_api.services.run_admission import AdmissionOutcome
 from aegra_api.services.run_executor import _shutdown_cancellations, _timeout_cancellations
 from aegra_api.services.worker_executor import (
     WorkerExecutor,
@@ -22,6 +22,7 @@ from aegra_api.services.worker_executor import (
     _LoadedRun,
     _release_lease,
     _requeue_drained_runs,
+    _reset_drained_runs,
     _restore_trace_context,
 )
 
@@ -64,6 +65,7 @@ def _make_run_orm(
     orm.run_id = run_id
     orm.thread_id = thread_id
     orm.status = status
+    orm.user_id = "test-user"
     orm.execution_params = execution_params or {
         "graph_id": "test-graph",
         "user": {"identity": "test-user", "is_authenticated": True, "permissions": []},
@@ -115,24 +117,30 @@ class TestIsValidRunId:
 
 class TestCapacityGate:
     @pytest.mark.asyncio
-    async def test_run_held_at_org_limit_is_not_loaded(self) -> None:
-        """At capacity the run stays pending — the promoter owns it now."""
+    @pytest.mark.parametrize(
+        "outcome",
+        [AdmissionOutcome.THREAD_BLOCKED, AdmissionOutcome.ORG_AT_CAPACITY],
+    )
+    async def test_blocked_run_is_committed_but_not_loaded(
+        self,
+        outcome: AdmissionOutcome,
+    ) -> None:
+        """Blocked-reason changes commit so the promoter can observe them."""
         session = AsyncMock()
-        session.rollback = AsyncMock()
         maker = _make_session_maker(session)
 
         with (
             patch(f"{MODULE}._get_session_maker", return_value=maker),
             patch(
-                f"{MODULE}.run_limits.try_start_run",
-                AsyncMock(return_value=run_limits.ClaimOutcome.AT_CAPACITY),
+                f"{MODULE}.try_start_run",
+                AsyncMock(return_value=outcome),
             ),
         ):
             result = await _acquire_and_load("run-1", "worker-1")
 
         assert result is None
-        session.rollback.assert_awaited_once()
-        session.commit.assert_not_awaited()
+        session.commit.assert_awaited_once()
+        session.rollback.assert_not_awaited()
 
 
 class TestAcquireAndLoad:
@@ -140,17 +148,17 @@ class TestAcquireAndLoad:
     async def test_returns_loaded_run_when_lease_acquired(self) -> None:
         run_orm = _make_run_orm()
         session = AsyncMock()
-
-        # First execute: UPDATE (lease acquisition)
-        update_result = MagicMock()
-        update_result.rowcount = 1
-        # Second call: scalar (SELECT run)
-        session.execute = AsyncMock(return_value=update_result)
         session.scalar = AsyncMock(return_value=run_orm)
         session.commit = AsyncMock()
         maker = _make_session_maker(session)
 
-        with patch(f"{MODULE}._get_session_maker", return_value=maker):
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=maker),
+            patch(
+                f"{MODULE}.try_start_run",
+                AsyncMock(return_value=AdmissionOutcome.CLAIMED),
+            ),
+        ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
 
         assert result is not None
@@ -162,17 +170,21 @@ class TestAcquireAndLoad:
     @pytest.mark.asyncio
     async def test_returns_none_when_lease_already_taken(self) -> None:
         session = AsyncMock()
-        update_result = MagicMock()
-        update_result.rowcount = 0
-        session.execute = AsyncMock(return_value=update_result)
         session.rollback = AsyncMock()
         maker = _make_session_maker(session)
 
-        with patch(f"{MODULE}._get_session_maker", return_value=maker):
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=maker),
+            patch(
+                f"{MODULE}.try_start_run",
+                AsyncMock(return_value=AdmissionOutcome.ALREADY_TAKEN),
+            ),
+        ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
 
         assert result is None
         session.rollback.assert_awaited_once()
+        session.commit.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_none_when_execution_params_is_none(self) -> None:
@@ -180,17 +192,33 @@ class TestAcquireAndLoad:
         run_orm.execution_params = None
 
         session = AsyncMock()
-        update_result = MagicMock()
-        update_result.rowcount = 1
-        session.execute = AsyncMock(return_value=update_result)
         session.scalar = AsyncMock(return_value=run_orm)
         session.commit = AsyncMock()
         maker = _make_session_maker(session)
 
-        with patch(f"{MODULE}._get_session_maker", return_value=maker):
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=maker),
+            patch(
+                f"{MODULE}.try_start_run",
+                AsyncMock(return_value=AdmissionOutcome.CLAIMED),
+            ),
+            patch(
+                f"{MODULE}.set_thread_status_if_no_active_runs",
+                new_callable=AsyncMock,
+            ) as set_thread_status,
+            patch(f"{MODULE}.run_queue_signal.notify") as notify,
+        ):
             result = await _acquire_and_load("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "worker-0")
 
         assert result is None
+        set_thread_status.assert_awaited_once_with(
+            session,
+            ["11111111-2222-3333-4444-555555555555"],
+            "error",
+            user_id="test-user",
+        )
+        session.commit.assert_awaited_once()
+        notify.assert_called_once()
 
 
 # ------------------------------------------------------------------
@@ -827,6 +855,29 @@ class TestExecuteAndRelease:
 
 class TestExecuteWithLease:
     @pytest.mark.asyncio
+    async def test_duplicate_deliveries_execute_only_claimed_copy(self) -> None:
+        run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        executor = WorkerExecutor()
+        loaded = _LoadedRun(_make_run_job(), {})
+        execute = AsyncMock()
+
+        with (
+            patch(
+                f"{MODULE}._acquire_and_load",
+                new_callable=AsyncMock,
+                side_effect=[loaded, None],
+            ),
+            patch(f"{MODULE}._restore_trace_context"),
+            patch(f"{MODULE}.execute_run", execute),
+            patch(f"{MODULE}._heartbeat_loop", new_callable=AsyncMock),
+            patch(f"{MODULE}._release_lease", new_callable=AsyncMock),
+        ):
+            await executor._execute_with_lease(run_id, "worker-0")
+            await executor._execute_with_lease(run_id, "worker-1")
+
+        execute.assert_awaited_once_with(loaded.job)
+
+    @pytest.mark.asyncio
     async def test_cancels_job_task_in_finally(self) -> None:
         """Regression: when _execute_with_lease is cancelled (e.g. by wait_for
         timeout), the inner job_task must also be cancelled to prevent orphaned
@@ -936,12 +987,64 @@ class TestDequeue:
         mock_warning.assert_called_once()
 
 
+class TestPostgresFallback:
+    @pytest.mark.asyncio
+    async def test_uses_shared_promotable_selector(self) -> None:
+        session = AsyncMock()
+        selector = AsyncMock(return_value=["eligible-run"])
+
+        with (
+            patch(
+                f"{MODULE}._get_session_maker",
+                return_value=_make_session_maker(session),
+            ),
+            patch(f"{MODULE}.find_promotable_runs", selector),
+        ):
+            result = await WorkerExecutor._poll_postgres()
+
+        assert result == "eligible-run"
+        selector.assert_awaited_once_with(session, batch_size=1)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_without_eligible_candidate(self) -> None:
+        session = AsyncMock()
+
+        with (
+            patch(
+                f"{MODULE}._get_session_maker",
+                return_value=_make_session_maker(session),
+            ),
+            patch(
+                f"{MODULE}.find_promotable_runs",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            assert await WorkerExecutor._poll_postgres() is None
+
+
 # ------------------------------------------------------------------
 # Drain requeue (#474)
 # ------------------------------------------------------------------
 
 
 class TestRequeueDrainedRuns:
+    @pytest.mark.asyncio
+    async def test_reset_is_database_only(self) -> None:
+        session = AsyncMock()
+        result = MagicMock()
+        result.fetchall.return_value = [("run-1",)]
+        session.execute = AsyncMock(return_value=result)
+
+        with (
+            patch(f"{MODULE}._get_session_maker", return_value=_make_session_maker(session)),
+            patch(f"{MODULE}.redis_manager.get_client", side_effect=AssertionError("Redis must not be used")),
+        ):
+            reset = await _reset_drained_runs(["run-1"])
+
+        assert reset == ["run-1"]
+        session.commit.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_resets_rows_and_pushes_to_queue(self) -> None:
         session = AsyncMock()

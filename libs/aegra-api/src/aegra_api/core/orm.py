@@ -20,7 +20,9 @@ from typing import Any
 import structlog
 from sqlalchemy import (
     TIMESTAMP,
+    BigInteger,
     Boolean,
+    CheckConstraint,
     Float,
     ForeignKey,
     Index,
@@ -201,6 +203,22 @@ class Run(Base):
     # creation. NULL means "no tenant" and is exempt from limits.
     org_id: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    multitask_strategy: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'enqueue'"),
+    )
+    queue_position: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("nextval('runs_queue_position_seq')"),
+    )
+    pending_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pending_reason_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+    )
+
     # Indexes for performance
     __table_args__ = (
         Index("idx_runs_thread_id", "thread_id"),
@@ -216,6 +234,25 @@ class Run(Base):
             "org_id",
             "created_at",
             postgresql_where=text("status IN ('pending', 'running')"),
+        ),
+        Index(
+            "idx_runs_thread_active_queue",
+            "thread_id",
+            "queue_position",
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
+        Index(
+            "idx_runs_pending_queue_position",
+            "queue_position",
+            postgresql_where=text("status = 'pending' AND claimed_by IS NULL"),
+        ),
+        CheckConstraint(
+            "multitask_strategy IN ('reject', 'interrupt', 'rollback', 'enqueue')",
+            name="ck_runs_multitask_strategy",
+        ),
+        CheckConstraint(
+            "pending_reason IS NULL OR pending_reason IN ('thread', 'org')",
+            name="ck_runs_pending_reason",
         ),
     )
 

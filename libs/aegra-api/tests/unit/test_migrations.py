@@ -1,12 +1,96 @@
 """Tests for aegra_api.core.migrations module."""
 
+import importlib.util
+import io
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 
 from aegra_api.core import migrations as migrations_mod
 from aegra_api.core.migrations import find_alembic_ini, get_alembic_config
+from aegra_api.core.orm import Base
+
+_RUN_ADMISSION_MIGRATION = (
+    Path(__file__).resolve().parents[2] / "alembic" / "versions" / "20261007000000_add_run_admission_fields.py"
+)
+
+
+def _load_run_admission_migration() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("run_admission_migration", _RUN_ADMISSION_MIGRATION)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _render_migration(direction: str) -> str:
+    output = io.StringIO()
+    context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    module = _load_run_admission_migration()
+    module.op = Operations(context)
+    getattr(module, direction)()
+    return output.getvalue()
+
+
+class TestRunAdmissionMigration:
+    def test_upgrade_emits_durable_order_and_constraints(self) -> None:
+        sql = _render_migration("upgrade")
+
+        assert "CREATE SEQUENCE runs_queue_position_seq" in sql
+        assert "ADD COLUMN multitask_strategy TEXT DEFAULT 'enqueue' NOT NULL" in sql
+        assert "execution_params #>> '{behavior,multitask_strategy}'" in sql
+        assert "IN ('reject', 'interrupt', 'rollback', 'enqueue')" in sql
+        assert "ADD COLUMN queue_position BIGINT" in sql
+        assert "row_number() OVER (ORDER BY created_at, run_id)" in sql
+        assert "SELECT setval(" in sql
+        assert "'runs_queue_position_seq'" in sql
+        assert "ALTER COLUMN queue_position SET NOT NULL" in sql
+        assert "ADD COLUMN pending_reason TEXT" in sql
+        assert "ADD COLUMN pending_reason_at TIMESTAMP WITH TIME ZONE" in sql
+        assert "ck_runs_multitask_strategy" in sql
+        assert "ck_runs_pending_reason" in sql
+        assert "idx_runs_thread_active_queue" in sql
+        assert "idx_runs_pending_queue_position" in sql
+        assert "WHERE status = 'pending' AND claimed_by IS NULL" in sql
+        assert "WHERE status IN ('pending', 'running')" in sql
+        assert sql.index("row_number()") < sql.index("ALTER COLUMN queue_position SET NOT NULL")
+
+    def test_downgrade_removes_every_admission_object(self) -> None:
+        sql = _render_migration("downgrade")
+
+        assert "DROP INDEX idx_runs_thread_active_queue" in sql
+        assert "DROP INDEX idx_runs_pending_queue_position" in sql
+        assert "DROP CONSTRAINT ck_runs_pending_reason" in sql
+        assert "DROP CONSTRAINT ck_runs_multitask_strategy" in sql
+        assert "DROP COLUMN pending_reason_at" in sql
+        assert "DROP COLUMN pending_reason" in sql
+        assert "DROP COLUMN queue_position" in sql
+        assert "DROP COLUMN multitask_strategy" in sql
+        assert "DROP SEQUENCE runs_queue_position_seq" in sql
+
+    def test_orm_maps_admission_columns_and_active_index(self) -> None:
+        runs = Base.metadata.tables["runs"]
+
+        assert not runs.c.multitask_strategy.nullable
+        assert not runs.c.queue_position.nullable
+        assert runs.c.pending_reason.nullable
+        assert runs.c.pending_reason_at.nullable
+        index = next(index for index in runs.indexes if index.name == "idx_runs_thread_active_queue")
+        assert [column.name for column in index.columns] == ["thread_id", "queue_position"]
+        assert str(index.dialect_options["postgresql"]["where"]) == "status IN ('pending', 'running')"
+        pending_index = next(index for index in runs.indexes if index.name == "idx_runs_pending_queue_position")
+        assert [column.name for column in pending_index.columns] == ["queue_position"]
+        assert str(pending_index.dialect_options["postgresql"]["where"]) == (
+            "status = 'pending' AND claimed_by IS NULL"
+        )
 
 
 class TestFindAlembicIni:

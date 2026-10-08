@@ -1,4 +1,4 @@
-.PHONY: help install dev-install setup-hooks format lint type-check security test test-api test-cli test-cov clean run ci-check openapi e2e-dev e2e-prod e2e-auth e2e-both e2e-run-limits e2e-ttl-delta
+.PHONY: help install dev-install setup-hooks format lint type-check security test test-api test-cli test-cov clean run ci-check openapi e2e-dev e2e-prod e2e-auth e2e-both e2e-run-limits e2e-ttl-delta e2e-enqueue-local e2e-enqueue-worker e2e-enqueue-both
 
 help:
 	@echo "Available commands:"
@@ -21,6 +21,7 @@ help:
 	@echo "  make e2e-both      - Run E2E tests in both modes"
 	@echo "  make e2e-run-limits - Run per-org run-limit E2E tests (add REDIS=1 for worker mode)"
 	@echo "  make e2e-ttl-delta - Run thread-TTL keep_latest / DeltaChannel guard E2E tests"
+	@echo "  make e2e-enqueue-both - Run enqueue FIFO E2E tests in local and worker modes"
 	@echo "  make clean         - Clean cache files"
 	@echo "  make run           - Run the server"
 
@@ -141,6 +142,12 @@ RUN_LIMITS_CEILING := 2
 TTL_DELTA_HARNESS := libs/aegra-api/tests/e2e/harness/thread_ttl
 TTL_DELTA_PORT := 2030
 
+ENQUEUE_HARNESS := libs/aegra-api/tests/e2e/harness/enqueue
+ENQUEUE_TEST := libs/aegra-api/tests/e2e/test_runs/test_multitask_enqueue.py
+ENQUEUE_LOCAL_PORT := 2031
+ENQUEUE_WORKER_PORT := 2032
+ENQUEUE_REMOTE_WORKER_PORT := 2033
+
 e2e-run-limits:
 	@docker compose up -d postgres $(if $(REDIS),redis,)
 	@echo "Waiting for Postgres..."; \
@@ -205,6 +212,64 @@ e2e-ttl-delta:
 	kill $$(cat /tmp/aegra-ttl-delta.pid) 2>/dev/null || true; \
 	rm -f /tmp/aegra-ttl-delta.pid; \
 	exit $$rc
+
+e2e-enqueue-local:
+	@docker compose up -d postgres
+	@set -e; \
+	export DATABASE_URL=postgresql://user:password@localhost:5434/aegra; \
+	export AEGRA_CONFIG=$(PWD)/$(ENQUEUE_HARNESS)/aegra.json; \
+	export SERVER_URL=http://127.0.0.1:$(ENQUEUE_LOCAL_PORT); \
+	export AUTH_TYPE=noop BACKFILL_THREAD_STATE_ON_STARTUP=false; \
+	export REDIS_BROKER_ENABLED=false ORG_RUN_LIMIT_MODE=enforce; \
+	export ORG_MAX_CONCURRENT_RUNS=2 ORG_RUN_PROMOTER_INTERVAL_SECONDS=0.2; \
+	cleanup() { kill $$server_pid 2>/dev/null || true; }; \
+	trap cleanup EXIT INT TERM; \
+	.venv/bin/python -m uvicorn aegra_api.main:app \
+		--host 127.0.0.1 --port $(ENQUEUE_LOCAL_PORT) \
+		> /tmp/aegra-enqueue-local.log 2>&1 & server_pid=$$!; \
+	for i in $$(seq 1 45); do \
+		curl -sf http://127.0.0.1:$(ENQUEUE_LOCAL_PORT)/health > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done; \
+	curl -sf http://127.0.0.1:$(ENQUEUE_LOCAL_PORT)/health > /dev/null; \
+	AEGRA_E2E_ENQUEUE=1 SERVER_URL=http://127.0.0.1:$(ENQUEUE_LOCAL_PORT) \
+		.venv/bin/pytest $(ENQUEUE_TEST) -v --tb=short
+
+e2e-enqueue-worker:
+	@docker compose up -d postgres redis
+	@set -e; \
+	export DATABASE_URL=postgresql://user:password@localhost:5434/aegra; \
+	export AEGRA_CONFIG=$(PWD)/$(ENQUEUE_HARNESS)/aegra.json; \
+	export SERVER_URL=http://127.0.0.1:$(ENQUEUE_WORKER_PORT); \
+	export AUTH_TYPE=noop BACKFILL_THREAD_STATE_ON_STARTUP=false; \
+	export REDIS_BROKER_ENABLED=true N_JOBS_PER_WORKER=10; \
+	export REDIS_URL=redis://localhost:$$(docker compose port redis 6379 | cut -d: -f2)/4; \
+	export ORG_RUN_LIMIT_MODE=enforce ORG_MAX_CONCURRENT_RUNS=2; \
+	export ORG_RUN_PROMOTER_INTERVAL_SECONDS=0.2; \
+	cleanup() { kill $$api_pid $$worker_pid 2>/dev/null || true; }; \
+	trap cleanup EXIT INT TERM; \
+	WORKER_COUNT=0 .venv/bin/python -m uvicorn aegra_api.main:app \
+		--host 127.0.0.1 --port $(ENQUEUE_WORKER_PORT) \
+		> /tmp/aegra-enqueue-api.log 2>&1 & api_pid=$$!; \
+	for i in $$(seq 1 45); do \
+		curl -sf http://127.0.0.1:$(ENQUEUE_WORKER_PORT)/health > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done; \
+	curl -sf http://127.0.0.1:$(ENQUEUE_WORKER_PORT)/health > /dev/null; \
+	WORKER_COUNT=2 SIDECAR_LIVE_PORT=8002 \
+		SERVER_URL=http://127.0.0.1:$(ENQUEUE_REMOTE_WORKER_PORT) \
+		.venv/bin/python -m uvicorn aegra_api.main:app \
+		--host 127.0.0.1 --port $(ENQUEUE_REMOTE_WORKER_PORT) \
+		> /tmp/aegra-enqueue-worker.log 2>&1 & worker_pid=$$!; \
+	for i in $$(seq 1 45); do \
+		curl -sf http://127.0.0.1:$(ENQUEUE_REMOTE_WORKER_PORT)/health > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done; \
+	curl -sf http://127.0.0.1:$(ENQUEUE_REMOTE_WORKER_PORT)/health > /dev/null; \
+	AEGRA_E2E_ENQUEUE=1 SERVER_URL=http://127.0.0.1:$(ENQUEUE_WORKER_PORT) \
+		.venv/bin/pytest $(ENQUEUE_TEST) -v --tb=short
+
+e2e-enqueue-both: e2e-enqueue-local e2e-enqueue-worker
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true

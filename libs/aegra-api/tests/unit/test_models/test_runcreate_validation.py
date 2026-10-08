@@ -1,9 +1,11 @@
 """Tests for RunCreate model validation."""
 
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import ValidationError
 
-from aegra_api.models.runs import RunCreate
+from aegra_api.models.runs import Run, RunCreate
 
 
 class TestRunCreateValidation:
@@ -30,6 +32,56 @@ class TestRunCreateValidation:
         """Ensure payloads with no input, command, or checkpoint are rejected."""
         with pytest.raises(ValueError, match="Must specify at least one of 'input', 'command', or 'checkpoint'"):
             RunCreate(assistant_id="agent")
+
+    @pytest.mark.parametrize("strategy", ["reject", "interrupt", "rollback", "enqueue"])
+    def test_accepts_protocol_multitask_strategies(self, strategy: str) -> None:
+        run_create = RunCreate(
+            assistant_id="agent",
+            input={},
+            multitask_strategy=strategy,
+        )
+
+        assert run_create.multitask_strategy == strategy
+
+    def test_multitask_strategy_remains_optional_on_requests(self) -> None:
+        run_create = RunCreate(assistant_id="agent", input={})
+
+        assert run_create.multitask_strategy is None
+
+    def test_rejects_unknown_multitask_strategy(self) -> None:
+        with pytest.raises(ValidationError):
+            RunCreate(
+                assistant_id="agent",
+                input={},
+                multitask_strategy="race",
+            )
+
+    def test_run_response_defaults_effective_strategy_to_enqueue(self) -> None:
+        run = Run(
+            run_id="run-1",
+            thread_id="thread-1",
+            assistant_id="agent",
+            input={},
+            user_id="user-1",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+
+        assert run.multitask_strategy == "enqueue"
+
+    def test_run_response_normalizes_unloaded_server_default(self) -> None:
+        run = Run(
+            run_id="run-1",
+            thread_id="thread-1",
+            assistant_id="agent",
+            input={},
+            user_id="user-1",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            multitask_strategy=None,  # type: ignore[arg-type]
+        )
+
+        assert run.multitask_strategy == "enqueue"
 
 
 class TestRunCreateMetadataValidation:

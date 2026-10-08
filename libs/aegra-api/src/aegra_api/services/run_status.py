@@ -19,6 +19,7 @@ from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.serializers import GeneralSerializer
+from aegra_api.services.run_queue_signal import run_queue_signal
 from aegra_api.utils.status_compat import validate_run_status, validate_thread_status
 
 logger = structlog.getLogger(__name__)
@@ -146,6 +147,7 @@ async def interrupt_unowned_run(
 
     await set_thread_status_if_no_active_runs(session, [thread_id], "idle", user_id=user_id)
     await session.commit()
+    run_queue_signal.notify()
     logger.info("Interrupted unowned run", run_id=run_id, thread_id=thread_id)
     return True
 
@@ -225,6 +227,7 @@ async def finalize_run(
         )
         await session.commit()
 
+    run_queue_signal.notify()
     logger.info("Finalized run", run_id=run_id, status=validated_run, thread_status=validated_thread)
     return True
 

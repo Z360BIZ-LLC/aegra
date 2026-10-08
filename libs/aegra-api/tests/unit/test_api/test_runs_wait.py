@@ -153,12 +153,13 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.uuid4", return_value=run_id),
             patch("aegra_api.services.run_waiters.executor") as mock_executor,
+            patch("aegra_api.services.run_preparation.executor") as mock_submit_executor,
             patch("aegra_api.services.run_waiters.settings") as mock_settings,
             patch("aegra_api.api.runs.active_runs", {}),
         ):
             mock_lg_service.return_value.list_graphs.return_value = ["test-graph"]
             mock_executor.wait_for_completion = AsyncMock(side_effect=timeout_wait)
-            mock_executor.submit = AsyncMock()
+            mock_submit_executor.submit = AsyncMock()
             mock_settings.app.KEEPALIVE_INTERVAL_SECS = 5
             mock_settings.worker.BG_JOB_TIMEOUT_SECS = 3600
 
@@ -194,12 +195,13 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.uuid4", return_value=run_id),
             patch("aegra_api.services.run_waiters.executor") as mock_executor,
+            patch("aegra_api.services.run_preparation.executor") as mock_submit_executor,
             patch("aegra_api.services.run_waiters.settings") as mock_settings,
             patch("aegra_api.api.runs.active_runs", {}),
         ):
             mock_lg_service.return_value.list_graphs.return_value = ["test-graph"]
             mock_executor.wait_for_completion = AsyncMock()
-            mock_executor.submit = AsyncMock()
+            mock_submit_executor.submit = AsyncMock()
             mock_settings.app.KEEPALIVE_INTERVAL_SECS = 5
             mock_settings.worker.BG_JOB_TIMEOUT_SECS = 3600
 
@@ -241,12 +243,13 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.uuid4", return_value=run_id),
             patch("aegra_api.services.run_waiters.executor") as mock_executor,
+            patch("aegra_api.services.run_preparation.executor") as mock_submit_executor,
             patch("aegra_api.services.run_waiters.settings") as mock_settings,
             patch("aegra_api.api.runs.active_runs", {}),
         ):
             mock_lg_service.return_value.list_graphs.return_value = ["test-graph"]
             mock_executor.wait_for_completion = AsyncMock()
-            mock_executor.submit = AsyncMock()
+            mock_submit_executor.submit = AsyncMock()
             mock_settings.app.KEEPALIVE_INTERVAL_SECS = 5
             mock_settings.worker.BG_JOB_TIMEOUT_SECS = 3600
 
@@ -288,12 +291,13 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.uuid4", return_value=run_id),
             patch("aegra_api.services.run_waiters.executor") as mock_executor,
+            patch("aegra_api.services.run_preparation.executor") as mock_submit_executor,
             patch("aegra_api.services.run_waiters.settings") as mock_settings,
             patch("aegra_api.api.runs.active_runs", {}),
         ):
             mock_lg_service.return_value.list_graphs.return_value = ["test-graph"]
             mock_executor.wait_for_completion = AsyncMock()
-            mock_executor.submit = AsyncMock()
+            mock_submit_executor.submit = AsyncMock()
             mock_settings.app.KEEPALIVE_INTERVAL_SECS = 5
             mock_settings.worker.BG_JOB_TIMEOUT_SECS = 3600
 
@@ -362,12 +366,13 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.uuid4", return_value=run_id),
             patch("aegra_api.services.run_waiters.executor") as mock_executor,
+            patch("aegra_api.services.run_preparation.executor") as mock_submit_executor,
             patch("aegra_api.services.run_waiters.settings") as mock_settings,
             patch("aegra_api.api.runs.active_runs", {}),
         ):
             mock_lg_service.return_value.list_graphs.return_value = ["test-graph"]
             mock_executor.wait_for_completion = AsyncMock()
-            mock_executor.submit = AsyncMock()
+            mock_submit_executor.submit = AsyncMock()
             mock_settings.app.KEEPALIVE_INTERVAL_SECS = 5
             mock_settings.worker.BG_JOB_TIMEOUT_SECS = 3600
 
