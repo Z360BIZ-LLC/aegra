@@ -170,10 +170,13 @@ class StreamingService:
         # An acknowledged end still proves publication finished; do not wait again.
         buffered_end = False
         for event_id, raw_event in await broker.replay(None):
-            sse_event = await self._convert_raw_to_sse(event_id, raw_event)
-            buffered_end = buffered_end or (sse_event is not None and _is_end_sse(sse_event))
+            stream_mode, _, _ = self.event_converter._parse_raw_event(raw_event)
+            buffered_end = buffered_end or stream_mode == "end"
             sequence = extract_event_sequence(event_id)
-            if sequence > last_sent_sequence and sse_event:
+            if sequence <= last_sent_sequence:
+                continue
+            sse_event = await self._convert_raw_to_sse(event_id, raw_event)
+            if sse_event:
                 last_sent_sequence = sequence
                 yield sse_event
         if buffered_end or broker.is_finished():

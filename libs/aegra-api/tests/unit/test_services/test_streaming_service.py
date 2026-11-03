@@ -667,3 +667,33 @@ class TestStreamingService:
         body = "".join(events)
         assert "event: end" in body
         assert f'{{"status":"{end_status}"}}' in body
+
+    @pytest.mark.parametrize("legacy_tuple", [False, True])
+    async def test_acknowledged_terminal_replay_skips_payload_serialization(self, legacy_tuple: bool) -> None:
+        service = StreamingService()
+        run = _run()
+        manager = BrokerManager()
+        broker = manager.get_or_create_broker(run.run_id)
+        await broker.put("run-123_event_1", ("values", {"result": "already received"}))
+        end: tuple[Any, ...] = ("end", {"status": "success"})
+        if legacy_tuple:
+            end = ("node", "end", {"status": "success"})
+        await broker.put("run-123_event_2", end)
+
+        with (
+            patch("aegra_api.services.streaming_service.broker_manager", manager),
+            patch.object(
+                service.event_converter,
+                "convert_raw_to_sse",
+                wraps=service.event_converter.convert_raw_to_sse,
+            ) as convert,
+        ):
+            events = await asyncio.wait_for(
+                _drain(service, run, last_event_id="run-123_event_2"),
+                timeout=0.5,
+            )
+
+        assert len(events) == 1
+        assert events[0].startswith("event: end")
+        assert '{"status":"success"}' in events[0]
+        convert.assert_not_called()
