@@ -3,6 +3,8 @@
 Uses Redis pub/sub for live event broadcast and Redis Lists for replay storage.
 The replay buffer (Redis List) stores resumable events with a TTL so they
 auto-expire without a cleanup loop. On reconnect, LRANGE fetches missed events.
+Only the newest full-state ``values`` event per namespace is kept; each one
+supersedes the last (see ``values_replay_slot``).
 
 Event sequence counters are stored as Redis INCR keys for O(1) cross-instance
 access (instead of deriving from the replay buffer with O(N) LRANGE).
@@ -24,9 +26,14 @@ from aegra_api.core.active_runs import active_runs, explicit_run_cancellations
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.models.enums import RunCancellationAction
-from aegra_api.services.base_broker import BaseBrokerManager, BaseRunBroker
+from aegra_api.services.base_broker import (
+    BaseBrokerManager,
+    BaseRunBroker,
+    resume_sequence,
+    values_replay_slot,
+)
 from aegra_api.settings import settings
-from aegra_api.utils import generate_event_id
+from aegra_api.utils import extract_event_sequence, generate_event_id
 
 logger = structlog.getLogger(__name__)
 
@@ -93,6 +100,11 @@ class RedisRunBroker(BaseRunBroker):
         # ordering — without it, a backoff sleep on one put could let a later
         # event's publish overtake an earlier one.
         self._write_lock = asyncio.Lock()
+        # The cached message of the newest ``values`` event per replay slot, so
+        # the next one in that slot can LREM it (see ``values_replay_slot``).
+        # Only the run's producer writes values events, so this process holds
+        # the message that is actually in the buffer.
+        self._latest_values: dict[str, str] = {}
 
     async def put(self, event_id: str, payload: Any, *, resumable: bool = True) -> None:
         """Append an event to the replay buffer and publish it to live subscribers.
@@ -115,6 +127,7 @@ class RedisRunBroker(BaseRunBroker):
         )
 
         is_end = isinstance(payload, tuple) and len(payload) >= 1 and payload[0] == "end"
+        slot = values_replay_slot(payload)
 
         async with self._write_lock:
             # Cache and publish are retried independently so a publish failure
@@ -123,13 +136,14 @@ class RedisRunBroker(BaseRunBroker):
             operation = "cache"
             try:
                 if resumable:
-                    await self._write_with_retry(self._cache_event, message)
+                    await self._write_with_retry(lambda m: self._cache_event(m, slot), message)
 
                 operation = "publish"
                 await self._write_with_retry(self._publish_event, message)
 
                 if is_end:
                     self._finished = True
+                    self._latest_values.clear()
             except RedisError as e:
                 logger.error(
                     f"Redis {operation} write failed for run {self.run_id} after {_PUT_MAX_ATTEMPTS} attempts: {e}"
@@ -139,16 +153,26 @@ class RedisRunBroker(BaseRunBroker):
                 if is_end:
                     self._finished = True
 
-    async def _cache_event(self, message: str) -> None:
-        """Append the event to the replay buffer and bump the sequence counter."""
+    async def _cache_event(self, message: str, slot: str | None = None) -> None:
+        """Append the event to the replay buffer and bump the sequence counter.
+
+        A ``values`` event also removes the one it supersedes in its slot, in the
+        same MULTI/EXEC transaction, so a reader never sees both or neither. LREM
+        with count 0 also removes a copy that a retried write appended twice.
+        """
         client = redis_manager.get_client()
+        superseded = self._latest_values.get(slot) if slot is not None else None
         pipe = client.pipeline()
         pipe.rpush(self._cache_key, message)
+        if superseded is not None:
+            pipe.lrem(self._cache_key, 0, superseded)
         pipe.ltrim(self._cache_key, -_REPLAY_MAX_EVENTS, -1)
         pipe.expire(self._cache_key, _REPLAY_TTL_SECONDS)
         pipe.incr(self._counter_key)
         pipe.expire(self._counter_key, _REPLAY_TTL_SECONDS)
         await pipe.execute()
+        if slot is not None:
+            self._latest_values[slot] = message
 
     async def _publish_event(self, message: str) -> None:
         """Broadcast the event to live subscribers."""
@@ -277,6 +301,8 @@ class RedisRunBroker(BaseRunBroker):
         all_events: list[tuple[str, Any]] = []
         events_after: list[tuple[str, Any]] = []
         found_last = last_event_id is None
+        resume_after = resume_sequence(self.run_id, last_event_id) if last_event_id is not None else None
+        events_after_sequence: list[tuple[str, Any]] = []
         prev_event_id: str | None = None
         for raw in raw_messages:
             data = json.loads(raw)
@@ -293,6 +319,8 @@ class RedisRunBroker(BaseRunBroker):
 
             payload = _deserialize_payload(data["payload"])
             all_events.append((event_id, payload))
+            if resume_after is not None and extract_event_sequence(event_id) > resume_after:
+                events_after_sequence.append((event_id, payload))
 
             if not found_last:
                 if event_id == last_event_id:
@@ -301,14 +329,18 @@ class RedisRunBroker(BaseRunBroker):
 
             events_after.append((event_id, payload))
 
-        # If last_event_id was not found in the buffer, return all events
-        if not found_last:
-            return all_events
-
-        return events_after
+        if found_last:
+            return events_after
+        # An id of this run the buffer no longer holds (a superseded values event):
+        # resume after its sequence instead of resending the whole run.
+        if resume_after is not None:
+            return events_after_sequence
+        # Any other unknown id: return all events
+        return all_events
 
     def mark_finished(self) -> None:
         self._finished = True
+        self._latest_values.clear()
         logger.debug(f"Redis broker for run {self.run_id} marked as finished")
 
     def is_finished(self) -> bool:

@@ -302,7 +302,7 @@ class TestRedisRunBroker:
         order: list[str] = []
         gate = asyncio.Event()
 
-        async def slow_first_cache(message: str) -> None:
+        async def slow_first_cache(message: str, slot: str | None = None) -> None:
             order.append("A-cache-start")
             await gate.wait()  # hold the write lock until released
             order.append("A-cache-end")
@@ -310,7 +310,7 @@ class TestRedisRunBroker:
         async def publish_noop(message: str) -> None:
             order.append("publish")
 
-        async def second_cache(message: str) -> None:
+        async def second_cache(message: str, slot: str | None = None) -> None:
             order.append("B-cache")
 
         broker._cache_event = slow_first_cache  # type: ignore[method-assign]
@@ -825,3 +825,152 @@ class TestRedisBrokerManager:
 
             await manager.stop()
             assert manager._running is False
+
+
+class TestRedisRunBrokerLatestValuesOnly:
+    """The Redis replay buffer keeps only the newest legacy values event per namespace."""
+
+    def _make_broker(self, run_id: str = "run-123") -> RedisRunBroker:
+        return RedisRunBroker(
+            run_id,
+            f"aegra:run:{run_id}",
+            f"aegra:run:cache:{run_id}",
+            f"aegra:run:counter:{run_id}",
+        )
+
+    @staticmethod
+    def _client() -> tuple[MagicMock, list[MagicMock]]:
+        """A client whose pipeline() returns a fresh mock per call, recorded in order."""
+        pipes: list[MagicMock] = []
+
+        def make_pipe() -> MagicMock:
+            pipe = MagicMock()
+            pipe.execute = AsyncMock()
+            pipes.append(pipe)
+            return pipe
+
+        client = MagicMock()
+        client.publish = AsyncMock()
+        client.pipeline.side_effect = make_pipe
+        return client, pipes
+
+    @pytest.mark.asyncio
+    async def test_values_removes_superseded_values_in_same_pipeline(self) -> None:
+        broker = self._make_broker()
+        client, pipes = self._client()
+
+        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
+            mock_rm.get_client.return_value = client
+            await broker.put("run-123_event_1", ("values", {"step": 1}))
+            await broker.put("run-123_event_2", ("messages", [{"content": "hi"}]))
+            await broker.put("run-123_event_3", ("values", {"step": 2}))
+
+        first_values_msg = pipes[0].rpush.call_args[0][1]
+        pipes[0].lrem.assert_not_called()
+        pipes[1].lrem.assert_not_called()
+        pipes[2].lrem.assert_called_once_with("aegra:run:cache:run-123", 0, first_values_msg)
+        pipes[2].execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_subgraph_values_tracked_per_namespace(self) -> None:
+        broker = self._make_broker()
+        client, pipes = self._client()
+
+        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
+            mock_rm.get_client.return_value = client
+            await broker.put("run-123_event_1", ("values", {"root": 1}))
+            await broker.put("run-123_event_2", ("values|sub:1", {"sub": 1}))
+            await broker.put("run-123_event_3", ("values|sub:1", {"sub": 2}))
+
+        pipes[1].lrem.assert_not_called()
+        pipes[2].lrem.assert_called_once_with("aegra:run:cache:run-123", 0, pipes[1].rpush.call_args[0][1])
+
+    @pytest.mark.asyncio
+    async def test_protocol_v2_values_never_removed(self) -> None:
+        broker = self._make_broker()
+        client, pipes = self._client()
+        event = {"type": "event", "method": "values", "params": {"namespace": [], "data": {"a": 1}}}
+
+        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
+            mock_rm.get_client.return_value = client
+            await broker.put("run-123_event_1", ("values", event))
+            await broker.put("run-123_event_2", ("values", event))
+
+        for pipe in pipes:
+            pipe.lrem.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_values_write_keeps_previous_as_superseded(self) -> None:
+        """A values event that never reached the buffer must not become the one to remove."""
+        broker = self._make_broker()
+        client, pipes = self._client()
+
+        with (
+            patch("aegra_api.services.redis_broker.redis_manager") as mock_rm,
+            patch("aegra_api.services.redis_broker.asyncio.sleep", new=AsyncMock()),
+        ):
+            mock_rm.get_client.return_value = client
+            await broker.put("run-123_event_1", ("values", {"step": 1}))
+            first_values_msg = pipes[0].rpush.call_args[0][1]
+
+            def failing_pipe() -> MagicMock:
+                pipe = MagicMock()
+                pipe.execute = AsyncMock(side_effect=RedisConnectionError("down"))
+                pipes.append(pipe)
+                return pipe
+
+            client.pipeline.side_effect = failing_pipe
+            await broker.put("run-123_event_2", ("values", {"step": 2}))
+
+            client.pipeline.side_effect = None
+            last_pipe = MagicMock()
+            last_pipe.execute = AsyncMock()
+            client.pipeline.return_value = last_pipe
+            await broker.put("run-123_event_3", ("values", {"step": 3}))
+
+        last_pipe.lrem.assert_called_once_with("aegra:run:cache:run-123", 0, first_values_msg)
+
+    @pytest.mark.asyncio
+    async def test_mark_finished_forgets_latest_values(self) -> None:
+        broker = self._make_broker()
+        client, _ = self._client()
+
+        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
+            mock_rm.get_client.return_value = client
+            await broker.put("run-123_event_1", ("values", {"step": 1}))
+
+        assert broker._latest_values
+        broker.mark_finished()
+        assert broker._latest_values == {}
+
+    @pytest.mark.asyncio
+    async def test_replay_resumes_after_superseded_event_by_sequence(self) -> None:
+        broker = self._make_broker()
+        mock_client = AsyncMock()
+        mock_client.lrange.return_value = [
+            json.dumps({"event_id": "run-123_event_2", "payload": ["messages", [{"content": "a"}]]}),
+            json.dumps({"event_id": "run-123_event_3", "payload": ["values", {"step": 2}]}),
+            json.dumps({"event_id": "run-123_event_4", "payload": ["end", {}]}),
+        ]
+
+        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
+            mock_rm.get_client.return_value = mock_client
+            events = await broker.replay("run-123_event_1")
+            later = await broker.replay("run-123_event_3")
+
+        assert [event_id for event_id, _ in events] == ["run-123_event_2", "run-123_event_3", "run-123_event_4"]
+        assert [event_id for event_id, _ in later] == ["run-123_event_4"]
+
+    @pytest.mark.asyncio
+    async def test_replay_unknown_id_of_other_run_returns_all(self) -> None:
+        broker = self._make_broker()
+        mock_client = AsyncMock()
+        mock_client.lrange.return_value = [
+            json.dumps({"event_id": "run-123_event_2", "payload": ["messages", []]}),
+        ]
+
+        with patch("aegra_api.services.redis_broker.redis_manager") as mock_rm:
+            mock_rm.get_client.return_value = mock_client
+            events = await broker.replay("run-999_event_1")
+
+        assert len(events) == 1

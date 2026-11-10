@@ -7,6 +7,45 @@ from typing import Any
 from aegra_api.models.enums import RunCancellationAction
 
 
+def values_replay_slot(payload: Any) -> str | None:
+    """Return the replay slot a full-state ``values`` event occupies, or None.
+
+    A ``values`` event is a complete snapshot of graph state, so each one
+    supersedes every earlier one in the same namespace: ``"values"`` for the
+    root graph, ``"values|<namespace>"`` for a subgraph. Replay buffers keep
+    only the newest event per slot. Keeping all of them stored a full copy of
+    the conversation for every step, which was most of a long run's buffer.
+
+    Only legacy stream events qualify. A native v3 protocol event (an Agent
+    Protocol v2 run) is left alone: ``ThreadEventSession`` derives its
+    ``seq`` reconnect cursor by counting buffered events, so removing one
+    would shift every later cursor.
+    """
+    if not isinstance(payload, (tuple, list)) or len(payload) < 2 or not isinstance(payload[0], str):
+        return None
+    mode, data = payload[0], payload[1]
+    if mode != "values" and not mode.startswith("values|"):
+        return None
+    if isinstance(data, dict) and data.get("type") == "event" and "params" in data:
+        return None
+    return mode
+
+
+def resume_sequence(run_id: str, last_event_id: str) -> int | None:
+    """Return the sequence to resume after, or None if the id is not this run's.
+
+    Replay first looks ``last_event_id`` up directly. This is the fallback for
+    an id the buffer no longer holds, most often a ``values`` event that a newer
+    one superseded: the client resumes after its sequence number instead of
+    receiving the whole run again.
+    """
+    prefix = f"{run_id}_event_"
+    if not last_event_id.startswith(prefix):
+        return None
+    sequence = last_event_id[len(prefix) :]
+    return int(sequence) if sequence.isdigit() else None
+
+
 class BaseRunBroker(ABC):
     """Abstract base class for a run-specific event broker.
 
@@ -33,8 +72,11 @@ class BaseRunBroker(ABC):
         """Return stored events for replay on reconnect.
 
         Args:
-            last_event_id: If provided, return events after this ID.
-                           If None, return all stored events.
+            last_event_id: If provided, return events after this ID. An ID
+                           of this run that the buffer no longer holds (a
+                           superseded ``values`` event) resumes after its
+                           sequence number. Any other unknown ID, or None,
+                           returns all stored events.
 
         Returns:
             List of (event_id, payload) tuples in order.

@@ -13,9 +13,14 @@ import structlog
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.models.enums import RunCancellationAction
-from aegra_api.services.base_broker import BaseBrokerManager, BaseRunBroker
+from aegra_api.services.base_broker import (
+    BaseBrokerManager,
+    BaseRunBroker,
+    resume_sequence,
+    values_replay_slot,
+)
 from aegra_api.settings import settings
-from aegra_api.utils import generate_event_id
+from aegra_api.utils import extract_event_sequence, generate_event_id
 
 logger = structlog.getLogger(__name__)
 
@@ -33,6 +38,8 @@ class RunBroker(BaseRunBroker):
         self.run_id = run_id
         self.finished = asyncio.Event()
         self._replay_buffer: list[tuple[str, Any]] = []
+        # event_id of the newest buffered ``values`` event per replay slot.
+        self._latest_values: dict[str, str] = {}
         self._subscribers: set[asyncio.Queue[tuple[str, Any]]] = set()
         self._created_at = asyncio.get_running_loop().time()
 
@@ -42,6 +49,14 @@ class RunBroker(BaseRunBroker):
             return
 
         if resumable:
+            # Keep only the newest full-state values event per slot, as the
+            # Redis broker does (see values_replay_slot).
+            slot = values_replay_slot(payload)
+            if slot is not None:
+                superseded = self._latest_values.get(slot)
+                if superseded is not None:
+                    self._replay_buffer = [event for event in self._replay_buffer if event[0] != superseded]
+                self._latest_values[slot] = event_id
             self._replay_buffer.append((event_id, payload))
 
         for queue in list(self._subscribers):
@@ -88,7 +103,13 @@ class RunBroker(BaseRunBroker):
             if eid == last_event_id:
                 return list(self._replay_buffer[i + 1 :])
 
-        # last_event_id not found — return all
+        # An id of this run the buffer no longer holds (a superseded values
+        # event): resume after its sequence instead of resending the whole run.
+        resume_after = resume_sequence(self.run_id, last_event_id)
+        if resume_after is not None:
+            return [event for event in self._replay_buffer if extract_event_sequence(event[0]) > resume_after]
+
+        # Any other unknown id: return all
         return list(self._replay_buffer)
 
     def mark_finished(self) -> None:
